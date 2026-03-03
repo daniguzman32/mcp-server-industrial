@@ -453,6 +453,7 @@ if __name__ == "__main__":
     import os
     transport = os.getenv("MCP_TRANSPORT", "streamable-http")
     if transport == "streamable-http":
-        mcp.run(transport="streamable-http")
+        port = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
+        mcp.run(transport="streamable-http", port=port)
     else:
         mcp.run()
