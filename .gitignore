@@ -1,0 +1,6 @@
+.env
+data/fachmann.db
+__pycache__/
+*.pyc
+*.pdf
+.pytest_cache/

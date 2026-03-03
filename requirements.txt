@@ -1,0 +1,7 @@
+mcp[cli]>=1.0
+aiosqlite
+python-dotenv
+python-telegram-bot>=21.0
+anthropic
+weasyprint
+jinja2
