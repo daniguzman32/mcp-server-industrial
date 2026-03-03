@@ -207,16 +207,24 @@ async def llamar_claude(requerimiento: str, cliente: str) -> dict:
         elif response.stop_reason == "end_turn":
             # Extraer el JSON de la respuesta final
             for block in response.content:
-                if hasattr(block, "text"):
+                if hasattr(block, "text") and block.text:
                     text = block.text.strip()
-                    # Limpiar markdown si está envuelto en ```json
-                    if text.startswith("```"):
-                        text = text.split("```")[1]
-                        if text.startswith("json"):
-                            text = text[4:]
-                    return json.loads(text.strip())
+                    # Intentar extraer JSON de bloque markdown ```json ... ```
+                    import re
+                    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+                    if match:
+                        text = match.group(1)
+                    # Si empieza directo con { es JSON puro
+                    elif not text.startswith("{"):
+                        # Buscar primer { hasta último }
+                        start = text.find("{")
+                        end = text.rfind("}") + 1
+                        if start != -1 and end > start:
+                            text = text[start:end]
+                    if text:
+                        return json.loads(text)
 
-            raise ValueError("Claude no devolvió contenido de texto")
+            raise ValueError("Claude no devolvió JSON válido en la respuesta")
         else:
             raise ValueError(f"Stop reason inesperado: {response.stop_reason}")
 

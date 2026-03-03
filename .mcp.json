@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "fachmann": {
+      "command": "python",
+      "args": ["src/server.py"],
+      "env": {
+        "DB_PATH": "data/fachmann.db"
+      }
+    }
+  }
+}

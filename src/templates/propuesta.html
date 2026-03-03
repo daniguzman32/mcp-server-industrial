@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<style>
+  @page { margin: 2cm; size: A4; }
+  body { font-family: Arial, sans-serif; font-size: 11pt; color: #222; }
+
+  .header { display: flex; justify-content: space-between; align-items: flex-start;
+            border-bottom: 3px solid #003366; padding-bottom: 12px; margin-bottom: 20px; }
+  .logo-area h1 { color: #003366; font-size: 22pt; margin: 0; }
+  .logo-area p  { color: #666; font-size: 9pt; margin: 2px 0; }
+  .doc-info { text-align: right; font-size: 9pt; color: #555; }
+  .doc-info strong { font-size: 13pt; color: #003366; display: block; }
+
+  .section-title { background: #003366; color: white; padding: 5px 10px;
+                   font-size: 10pt; font-weight: bold; margin: 18px 0 8px; }
+
+  .info-grid { display: grid; grid-template-columns: 140px 1fr; gap: 4px 8px; font-size: 10pt; }
+  .info-grid .label { font-weight: bold; color: #444; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 10pt; margin-top: 8px; }
+  th { background: #003366; color: white; padding: 7px 10px; text-align: left; }
+  td { padding: 6px 10px; border-bottom: 1px solid #ddd; }
+  tr:nth-child(even) td { background: #f5f7fa; }
+  .right { text-align: right; }
+
+  .total-row td { font-weight: bold; background: #e8edf5; font-size: 12pt; }
+
+  .norma-box { background: #f0f4f8; border-left: 4px solid #003366;
+               padding: 10px 14px; font-size: 10pt; margin-top: 8px; }
+
+  .condiciones { font-size: 9pt; color: #555; margin-top: 6px; }
+  .condiciones li { margin: 3px 0; }
+
+  .footer { margin-top: 30px; border-top: 1px solid #ccc; padding-top: 10px;
+            font-size: 9pt; color: #888; text-align: center; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo-area">
+    <h1>FACHMANN</h1>
+    <p>Representación Comercial Argentina</p>
+    <p><strong>PILZ &nbsp;·&nbsp; OBO Bettermann &nbsp;·&nbsp; CABUR</strong></p>
+  </div>
+  <div class="doc-info">
+    <strong>PROPUESTA TÉCNICA</strong>
+    N° {{ numero_propuesta }}<br>
+    Fecha: {{ fecha }}<br>
+    Válida por {{ propuesta.validez_dias }} días
+  </div>
+</div>
+
+<div class="section-title">DATOS DEL CLIENTE</div>
+<div class="info-grid">
+  <span class="label">Empresa:</span>     <span>{{ propuesta.cliente }}</span>
+</div>
+
+<div class="section-title">REQUERIMIENTO</div>
+<p style="font-size:10pt; margin:6px 0;">{{ propuesta.requerimiento }}</p>
+
+<div class="section-title">SOLUCIÓN TÉCNICA</div>
+<table>
+  <thead>
+    <tr>
+      <th>SKU</th>
+      <th>Descripción</th>
+      <th style="text-align:right">Cant.</th>
+      <th style="text-align:right">Precio Unit. USD</th>
+      <th style="text-align:right">Subtotal USD</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in propuesta.productos %}
+    <tr>
+      <td><code>{{ p.sku }}</code></td>
+      <td>{{ p.descripcion }}<br>
+          <small style="color:#666">{{ p.justificacion }}</small></td>
+      <td class="right">{{ p.cantidad }}</td>
+      <td class="right">{{ "%.2f"|format(p.precio_usd) }}</td>
+      <td class="right">{{ "%.2f"|format(p.cantidad * p.precio_usd) }}</td>
+    </tr>
+    {% endfor %}
+    <tr class="total-row">
+      <td colspan="4" class="right">TOTAL (sin IVA)</td>
+      <td class="right">USD {{ "%.2f"|format(propuesta.total_usd) }}</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="section-title">JUSTIFICACIÓN NORMATIVA</div>
+<div class="norma-box">
+  {{ propuesta.norma_aplicable }}
+  {% if propuesta.notas_tecnicas %}
+  <br><br>{{ propuesta.notas_tecnicas }}
+  {% endif %}
+</div>
+
+<div class="section-title">CONDICIONES COMERCIALES</div>
+<ul class="condiciones">
+  <li>Precios expresados en dólares estadounidenses (USD), sin IVA.</li>
+  <li>Tiempo de entrega estimado: <strong>{{ propuesta.tiempo_entrega_dias }} días hábiles</strong> desde confirmación del pedido.</li>
+  <li>Validez de la propuesta: <strong>{{ propuesta.validez_dias }} días corridos</strong>.</li>
+  <li>Forma de pago: a convenir.</li>
+</ul>
+
+<div class="footer">
+  Fachmann — Representación Comercial Argentina &nbsp;|&nbsp;
+  Propuesta generada automáticamente · {{ fecha }}
+</div>
+
+</body>
+</html>

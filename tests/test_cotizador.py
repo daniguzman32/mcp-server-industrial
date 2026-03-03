@@ -1,3 +1,4 @@
+import sys
 import pytest
 import json
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -41,6 +42,10 @@ async def test_cotizador_devuelve_json_estructurado():
     assert resultado["total_usd"] > 0
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="weasyprint requiere GTK3, no disponible en Windows — el test corre en Railway (Linux)"
+)
 def test_pdf_generator_retorna_bytes():
     """El generador debe retornar bytes de un PDF válido."""
     from src.pdf_generator import generar_pdf
