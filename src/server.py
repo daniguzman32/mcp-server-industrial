@@ -39,7 +39,10 @@ async def app_lifespan(app):
     await db.close()
 
 
-mcp = FastMCP("fachmann_mcp", lifespan=app_lifespan)
+_port = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
+_host = os.getenv("MCP_HOST", "0.0.0.0")
+
+mcp = FastMCP("fachmann_mcp", lifespan=app_lifespan, host=_host, port=_port)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -450,10 +453,5 @@ async def fachmann_registrar_interaccion(params: RegistrarInteraccionInput, ctx:
 
 
 if __name__ == "__main__":
-    import os
     transport = os.getenv("MCP_TRANSPORT", "streamable-http")
-    if transport == "streamable-http":
-        port = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
-        mcp.run(transport="streamable-http", port=port)
-    else:
-        mcp.run()
+    mcp.run(transport=transport)
