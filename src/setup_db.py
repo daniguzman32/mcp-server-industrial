@@ -6,6 +6,7 @@ Ejecutar una sola vez: python src/setup_db.py
 
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -166,3 +167,4 @@ if __name__ == "__main__":
 
     print(f"Base de datos lista: {DB_PATH}")
     print("Tablas creadas: productos_catalogo, clientes_prospectos, oportunidades_ventas, interacciones")
+    sys.exit(0)
