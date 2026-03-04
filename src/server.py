@@ -16,27 +16,26 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
-import aiosqlite
+import asyncpg
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 load_dotenv()
 
-DB_PATH = os.getenv("DB_PATH", "data/fachmann.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 MARCAS_VALIDAS = {"PILZ", "OBO", "CABUR"}
 TIPOS_INTERACCION = {"reunion", "email", "llamada", "whatsapp", "nota"}
 
 
-# ── Lifespan: conexión persistente a SQLite ───────────────────────────────────
+# ── Lifespan: pool de conexiones a PostgreSQL ─────────────────────────────────
 
 @asynccontextmanager
 async def app_lifespan(app):
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
-    yield {"db": db}
-    await db.close()
+    pool = await asyncpg.create_pool(DATABASE_URL)
+    yield {"db": pool}
+    await pool.close()
 
 
 _port = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
@@ -47,7 +46,7 @@ mcp = FastMCP("fachmann_mcp", lifespan=app_lifespan, host=_host, port=_port)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _rows_to_dicts(rows: list) -> list[dict]:
+def _rows_to_dicts(rows) -> list[dict]:
     return [dict(r) for r in rows]
 
 
@@ -157,54 +156,33 @@ async def fachmann_buscar_catalogo(params: BuscarCatalogoInput, ctx: Context) ->
             - marca (Optional[str]): Filtro de marca: 'PILZ', 'OBO' o 'CABUR'. Omitir para todas.
 
     Returns:
-        str: JSON con lista de productos encontrados:
-        {
-            "total": int,
-            "productos": [
-                {
-                    "sku": str,
-                    "marca": str,
-                    "categoria": str,
-                    "descripcion": str,
-                    "precio_usd": float,
-                    "stock": int,
-                    "tiempo_entrega_dias": int
-                }
-            ]
-        }
-        Retorna mensaje de texto si no hay resultados.
-
-    Examples:
-        - "Buscar relés de seguridad PILZ"       → query="relé seguridad", marca="PILZ"
-        - "Mostrar catálogo completo OBO"         → query="bandeja", marca="OBO"
-        - "Qué borneras tenemos disponibles"      → query="bornera", marca=None
-        - "Buscar monitor de velocidad"           → query="monitor velocidad", marca=None
+        str: JSON con lista de productos encontrados.
     """
     try:
-        db: aiosqlite.Connection = ctx.request_context.lifespan_state["db"]
+        pool: asyncpg.Pool = ctx.request_context.lifespan_state["db"]
         like = f"%{params.query}%"
 
-        if params.marca:
-            sql = """
-                SELECT sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias
-                FROM productos_catalogo
-                WHERE activo = 1 AND marca = ?
-                  AND (descripcion LIKE ? OR sku LIKE ? OR categoria LIKE ? OR especificaciones LIKE ?)
-                ORDER BY marca, categoria, sku
-            """
-            args = (params.marca, like, like, like, like)
-        else:
-            sql = """
-                SELECT sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias
-                FROM productos_catalogo
-                WHERE activo = 1
-                  AND (descripcion LIKE ? OR sku LIKE ? OR categoria LIKE ? OR especificaciones LIKE ?)
-                ORDER BY marca, categoria, sku
-            """
-            args = (like, like, like, like)
+        async with pool.acquire() as conn:
+            if params.marca:
+                rows = await conn.fetch(
+                    """SELECT sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias
+                       FROM productos_catalogo
+                       WHERE activo = 1 AND marca = $1
+                         AND (descripcion ILIKE $2 OR sku ILIKE $3 OR categoria ILIKE $4 OR especificaciones ILIKE $5)
+                       ORDER BY marca, categoria, sku""",
+                    params.marca, like, like, like, like,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias
+                       FROM productos_catalogo
+                       WHERE activo = 1
+                         AND (descripcion ILIKE $1 OR sku ILIKE $2 OR categoria ILIKE $3 OR especificaciones ILIKE $4)
+                       ORDER BY marca, categoria, sku""",
+                    like, like, like, like,
+                )
 
-        async with db.execute(sql, args) as cursor:
-            rows = _rows_to_dicts(await cursor.fetchall())
+        rows = _rows_to_dicts(rows)
 
         if not rows:
             filtro = f" en marca '{params.marca}'" if params.marca else ""
@@ -237,31 +215,19 @@ async def fachmann_consultar_disponibilidad(params: ConsultarDisponibilidadInput
             - sku (str): Código exacto del producto (ej. 'PNOZ-S6-24VDC-2NO', 'OBO-TS-60-E-2M')
 
     Returns:
-        str: JSON con ficha completa del producto:
-        {
-            "sku": str,
-            "marca": str,
-            "categoria": str,
-            "descripcion": str,
-            "precio_usd": float,
-            "especificaciones": str,
-            "stock": int,
-            "tiempo_entrega_dias": int,
-            "disponible_inmediato": bool
-        }
-        Retorna error con sugerencia si el SKU no existe.
+        str: JSON con ficha completa del producto.
     """
     try:
-        db: aiosqlite.Connection = ctx.request_context.lifespan_state["db"]
+        pool: asyncpg.Pool = ctx.request_context.lifespan_state["db"]
 
-        async with db.execute(
-            """SELECT sku, marca, categoria, descripcion, precio_usd,
-                      especificaciones, stock, tiempo_entrega_dias
-               FROM productos_catalogo
-               WHERE sku = ? AND activo = 1""",
-            (params.sku,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT sku, marca, categoria, descripcion, precio_usd,
+                          especificaciones, stock, tiempo_entrega_dias
+                   FROM productos_catalogo
+                   WHERE sku = $1 AND activo = 1""",
+                params.sku,
+            )
 
         if row is None:
             return (
@@ -299,67 +265,44 @@ async def fachmann_buscar_contexto_cliente(params: BuscarContextoClienteInput, c
             - empresa (str): Nombre o fragmento del nombre de la empresa o contacto
 
     Returns:
-        str: JSON con coincidencias encontradas:
-        {
-            "total": int,
-            "clientes": [
-                {
-                    "id": int,
-                    "razon_social": str,
-                    "contacto_nombre": str,
-                    "contacto_email": str,
-                    "contacto_telefono": str,
-                    "industria": str,
-                    "estado_lead": str,
-                    "linkedin_url": str | null,
-                    "notas": str,
-                    "interacciones_recientes": [...],   // últimas 5
-                    "oportunidades_activas": [...]      // oportunidades abiertas
-                }
-            ]
-        }
-
-    Examples:
-        - "Prepararme para llamar a Arcor"        → empresa="Arcor"
-        - "Ver historial de Sistemi"              → empresa="Sistemi"
-        - "Buscar contacto Valentina Bruni"       → empresa="Valentina"
+        str: JSON con coincidencias encontradas, incluyendo historial e interacciones.
     """
     try:
-        db: aiosqlite.Connection = ctx.request_context.lifespan_state["db"]
+        pool: asyncpg.Pool = ctx.request_context.lifespan_state["db"]
         like = f"%{params.empresa}%"
 
-        async with db.execute(
-            """SELECT id, razon_social, contacto_nombre, contacto_email, contacto_telefono,
-                      industria, estado_lead, linkedin_url, notas, created_at
-               FROM clientes_prospectos
-               WHERE razon_social LIKE ? OR contacto_nombre LIKE ?
-               ORDER BY razon_social""",
-            (like, like),
-        ) as cursor:
-            clientes = _rows_to_dicts(await cursor.fetchall())
+        async with pool.acquire() as conn:
+            clientes_rows = await conn.fetch(
+                """SELECT id, razon_social, contacto_nombre, contacto_email, contacto_telefono,
+                          industria, estado_lead, linkedin_url, notas, created_at
+                   FROM clientes_prospectos
+                   WHERE razon_social ILIKE $1 OR contacto_nombre ILIKE $2
+                   ORDER BY razon_social""",
+                like, like,
+            )
 
-        if not clientes:
-            return f"No se encontraron clientes que coincidan con '{params.empresa}'."
+            if not clientes_rows:
+                return f"No se encontraron clientes que coincidan con '{params.empresa}'."
 
-        for cliente in clientes:
-            cid = cliente["id"]
+            clientes = _rows_to_dicts(clientes_rows)
 
-            async with db.execute(
-                """SELECT tipo, notas, fecha FROM interacciones
-                   WHERE cliente_id = ?
-                   ORDER BY fecha DESC LIMIT 5""",
-                (cid,),
-            ) as cursor:
-                cliente["interacciones_recientes"] = _rows_to_dicts(await cursor.fetchall())
+            for cliente in clientes:
+                cid = cliente["id"]
 
-            async with db.execute(
-                """SELECT id, descripcion, monto_usd, probabilidad_cierre, etapa, notas_tecnicas, fecha_cierre_estimada
-                   FROM oportunidades_ventas
-                   WHERE cliente_id = ? AND etapa NOT IN ('closed_won', 'closed_lost')
-                   ORDER BY probabilidad_cierre DESC""",
-                (cid,),
-            ) as cursor:
-                cliente["oportunidades_activas"] = _rows_to_dicts(await cursor.fetchall())
+                cliente["interacciones_recientes"] = _rows_to_dicts(await conn.fetch(
+                    """SELECT tipo, notas, fecha FROM interacciones
+                       WHERE cliente_id = $1
+                       ORDER BY fecha DESC LIMIT 5""",
+                    cid,
+                ))
+
+                cliente["oportunidades_activas"] = _rows_to_dicts(await conn.fetch(
+                    """SELECT id, descripcion, monto_usd, probabilidad_cierre, etapa, notas_tecnicas, fecha_cierre_estimada
+                       FROM oportunidades_ventas
+                       WHERE cliente_id = $1 AND etapa NOT IN ('closed_won', 'closed_lost')
+                       ORDER BY probabilidad_cierre DESC""",
+                    cid,
+                ))
 
         return json.dumps({"total": len(clientes), "clientes": clientes}, indent=2, ensure_ascii=False)
 
@@ -390,56 +333,39 @@ async def fachmann_registrar_interaccion(params: RegistrarInteraccionInput, ctx:
             - tipo (str): 'reunion', 'email', 'llamada', 'whatsapp' o 'nota' (default: 'nota')
 
     Returns:
-        str: JSON de confirmación:
-        {
-            "success": true,
-            "interaccion_id": int,
-            "cliente": str,
-            "tipo": str,
-            "fecha": str,
-            "notas": str
-        }
-        Retorna error si el cliente_id no existe.
-
-    Examples:
-        - Después de una reunión → tipo="reunion", notas="Presentamos propuesta PILZ. Deciden en 2 semanas."
-        - Después de un email   → tipo="email",   notas="Enviada cotización formal #COT-2026-042."
-        - Nota rápida           → tipo="nota",    notas="LinkedIn: visto que publicó sobre automatización."
+        str: JSON de confirmación con interaccion_id, cliente, tipo y fecha.
     """
     try:
-        db: aiosqlite.Connection = ctx.request_context.lifespan_state["db"]
-
-        async with db.execute(
-            "SELECT razon_social FROM clientes_prospectos WHERE id = ?",
-            (params.cliente_id,),
-        ) as cursor:
-            cliente_row = await cursor.fetchone()
-
-        if cliente_row is None:
-            return (
-                f"Error: No existe un cliente con ID {params.cliente_id}. "
-                "Use fachmann_buscar_contexto_cliente para obtener el ID correcto."
-            )
-
+        pool: asyncpg.Pool = ctx.request_context.lifespan_state["db"]
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        async with db.execute(
-            "INSERT INTO interacciones (cliente_id, tipo, notas, fecha) VALUES (?, ?, ?, ?)",
-            (params.cliente_id, params.tipo, params.notas, fecha),
-        ) as cursor:
-            interaccion_id = cursor.lastrowid
+        async with pool.acquire() as conn:
+            cliente_row = await conn.fetchrow(
+                "SELECT razon_social FROM clientes_prospectos WHERE id = $1",
+                params.cliente_id,
+            )
 
-        await db.execute(
-            "UPDATE clientes_prospectos SET updated_at = ? WHERE id = ?",
-            (fecha, params.cliente_id),
-        )
-        await db.commit()
+            if cliente_row is None:
+                return (
+                    f"Error: No existe un cliente con ID {params.cliente_id}. "
+                    "Use fachmann_buscar_contexto_cliente para obtener el ID correcto."
+                )
+
+            async with conn.transaction():
+                interaccion_id = await conn.fetchval(
+                    "INSERT INTO interacciones (cliente_id, tipo, notas, fecha) VALUES ($1, $2, $3, $4) RETURNING id",
+                    params.cliente_id, params.tipo, params.notas, fecha,
+                )
+                await conn.execute(
+                    "UPDATE clientes_prospectos SET updated_at = $1 WHERE id = $2",
+                    fecha, params.cliente_id,
+                )
 
         return json.dumps(
             {
                 "success": True,
                 "interaccion_id": interaccion_id,
-                "cliente": dict(cliente_row)["razon_social"],
+                "cliente": cliente_row["razon_social"],
                 "tipo": params.tipo,
                 "fecha": fecha,
                 "notas": params.notas,

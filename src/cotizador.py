@@ -6,15 +6,18 @@ técnica estructurada usando Claude API con function calling.
 
 import json
 import os
-import sqlite3
+import re
 from typing import Optional
 
 import anthropic
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DB_PATH = os.getenv("DB_PATH", "data/fachmann.db")
+# Railway provee postgres://, psycopg2 requiere postgresql://
+DATABASE_URL = os.getenv("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 SYSTEM_PROMPT = """Sos un experto técnico comercial de Fachmann, representante en Argentina de PILZ, OBO Bettermann y CABUR.
@@ -115,40 +118,45 @@ TOOLS = [
 ]
 
 
+def _get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
 def _ejecutar_buscar_catalogo(query: str, marca: Optional[str] = None) -> list[dict]:
     like = f"%{query}%"
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        if marca:
-            rows = conn.execute(
-                """SELECT sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias
-                   FROM productos_catalogo
-                   WHERE activo = 1 AND marca = ?
-                     AND (descripcion LIKE ? OR sku LIKE ? OR categoria LIKE ? OR especificaciones LIKE ?)
-                   ORDER BY marca, categoria""",
-                (marca, like, like, like, like)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias
-                   FROM productos_catalogo
-                   WHERE activo = 1
-                     AND (descripcion LIKE ? OR sku LIKE ? OR categoria LIKE ? OR especificaciones LIKE ?)
-                   ORDER BY marca, categoria""",
-                (like, like, like, like)
-            ).fetchall()
-    return [dict(r) for r in rows]
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if marca:
+                cur.execute(
+                    """SELECT sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias
+                       FROM productos_catalogo
+                       WHERE activo = 1 AND marca = %s
+                         AND (descripcion ILIKE %s OR sku ILIKE %s OR categoria ILIKE %s OR especificaciones ILIKE %s)
+                       ORDER BY marca, categoria""",
+                    (marca, like, like, like, like),
+                )
+            else:
+                cur.execute(
+                    """SELECT sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias
+                       FROM productos_catalogo
+                       WHERE activo = 1
+                         AND (descripcion ILIKE %s OR sku ILIKE %s OR categoria ILIKE %s OR especificaciones ILIKE %s)
+                       ORDER BY marca, categoria""",
+                    (like, like, like, like),
+                )
+            return [dict(r) for r in cur.fetchall()]
 
 
 def _ejecutar_consultar_disponibilidad(sku: str) -> dict:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """SELECT sku, marca, categoria, descripcion, precio_usd,
-                      especificaciones, stock, tiempo_entrega_dias
-               FROM productos_catalogo WHERE sku = ? AND activo = 1""",
-            (sku,)
-        ).fetchone()
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT sku, marca, categoria, descripcion, precio_usd,
+                          especificaciones, stock, tiempo_entrega_dias
+                   FROM productos_catalogo WHERE sku = %s AND activo = 1""",
+                (sku,),
+            )
+            row = cur.fetchone()
     if row is None:
         return {"error": f"SKU '{sku}' no encontrado"}
     result = dict(row)
@@ -160,7 +168,7 @@ def _ejecutar_tool(tool_name: str, tool_input: dict) -> str:
     if tool_name == "buscar_catalogo":
         resultado = _ejecutar_buscar_catalogo(
             query=tool_input["query"],
-            marca=tool_input.get("marca")
+            marca=tool_input.get("marca"),
         )
         return json.dumps(resultado, ensure_ascii=False)
     elif tool_name == "consultar_disponibilidad":
@@ -186,11 +194,10 @@ async def llamar_claude(requerimiento: str, cliente: str) -> dict:
             max_tokens=4096,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
-            messages=messages
+            messages=messages,
         )
 
         if response.stop_reason == "tool_use":
-            # Ejecutar todas las tools solicitadas
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -198,25 +205,20 @@ async def llamar_claude(requerimiento: str, cliente: str) -> dict:
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": resultado
+                        "content": resultado,
                     })
 
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": tool_results})
 
         elif response.stop_reason == "end_turn":
-            # Extraer el JSON de la respuesta final
             for block in response.content:
                 if hasattr(block, "text") and block.text:
                     text = block.text.strip()
-                    # Intentar extraer JSON de bloque markdown ```json ... ```
-                    import re
                     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
                     if match:
                         text = match.group(1)
-                    # Si empieza directo con { es JSON puro
                     elif not text.startswith("{"):
-                        # Buscar primer { hasta último }
                         start = text.find("{")
                         end = text.rfind("}") + 1
                         if start != -1 and end > start:
