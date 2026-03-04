@@ -13,8 +13,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Railway provee postgres://, psycopg2 requiere postgresql://
-DATABASE_URL = os.getenv("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
+# Preferir DATABASE_PUBLIC_URL (accesible desde local y desde Railway).
+# DATABASE_URL usa hostname interno (railway.internal) solo accesible dentro de Railway.
+_raw = os.getenv("DATABASE_PUBLIC_URL") or os.getenv("DATABASE_URL", "")
+DATABASE_URL = _raw.replace("postgres://", "postgresql://", 1)
 
 DDL = [
     """CREATE TABLE IF NOT EXISTS productos_catalogo (
