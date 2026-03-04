@@ -1,6 +1,11 @@
 .env
 data/fachmann.db
+STRATEGY.md
 __pycache__/
 *.pyc
 *.pdf
 .pytest_cache/
+# Scripts de administración local (contienen lógica de negocio privada)
+src/importar_catalogo.py
+*.xlsx
+*.xls

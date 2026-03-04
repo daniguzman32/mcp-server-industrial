@@ -20,7 +20,7 @@ DDL = [
     """CREATE TABLE IF NOT EXISTS productos_catalogo (
         id                   SERIAL PRIMARY KEY,
         sku                  TEXT    UNIQUE NOT NULL,
-        marca                TEXT    NOT NULL CHECK(marca IN ('PILZ', 'OBO', 'CABUR')),
+        marca                TEXT    NOT NULL CHECK(marca IN ('PILZ', 'OBO', 'CABUR', 'IDEM SAFETY')),
         categoria            TEXT    NOT NULL,
         descripcion          TEXT    NOT NULL,
         precio_usd           REAL,
@@ -65,11 +65,21 @@ DDL = [
         notas      TEXT NOT NULL,
         fecha      TEXT DEFAULT NOW()::TEXT
     )""",
+    """CREATE TABLE IF NOT EXISTS reglas_descuento (
+        id              SERIAL PRIMARY KEY,
+        tarifa_nombre   TEXT    NOT NULL,
+        marca           TEXT    NOT NULL CHECK(marca IN ('PILZ', 'OBO', 'CABUR')),
+        desc_1          REAL    NOT NULL DEFAULT 0.0,
+        desc_2          REAL    NOT NULL DEFAULT 0.0,
+        desc_3          REAL    NOT NULL DEFAULT 0.0,
+        UNIQUE(tarifa_nombre, marca)
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_productos_marca     ON productos_catalogo(marca)",
     "CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos_catalogo(categoria)",
     "CREATE INDEX IF NOT EXISTS idx_clientes_nombre     ON clientes_prospectos(razon_social)",
     "CREATE INDEX IF NOT EXISTS idx_interacciones_cli   ON interacciones(cliente_id)",
     "CREATE INDEX IF NOT EXISTS idx_oportunidades_cli   ON oportunidades_ventas(cliente_id)",
+    "CREATE INDEX IF NOT EXISTS idx_reglas_tarifa       ON reglas_descuento(tarifa_nombre)",
 ]
 
 
@@ -167,6 +177,32 @@ def insert_seed_data(conn) -> None:
     print("Seed data insertado: 15 productos, 7 clientes, 5 oportunidades, 6 interacciones.")
 
 
+def insert_reglas_descuento(conn) -> None:
+    """Inserta las reglas de descuento por tarifa y marca. Idempotente."""
+    reglas = [
+        # (tarifa_nombre, marca, desc_1, desc_2, desc_3)
+        ("Dist. Principal - Pilz 25% - Resto 30+10", "PILZ",  25.0,  0.0, 0.0),
+        ("Dist. Principal - Pilz 25% - Resto 30+10", "OBO",   30.0, 10.0, 0.0),
+        ("Dist. Principal - Pilz 25% - Resto 30+10", "CABUR", 30.0, 10.0, 0.0),
+        ("Pilz System Partner - 30+10",               "PILZ",  30.0, 10.0, 0.0),
+        ("30% OBO - Cabur - Pilz 0%",                 "OBO",   30.0,  0.0, 0.0),
+        ("30% OBO - Cabur - Pilz 0%",                 "CABUR", 30.0,  0.0, 0.0),
+        ("30% OBO - Cabur - Pilz 0%",                 "PILZ",   0.0,  0.0, 0.0),
+        ("End User (5%)",                              "PILZ",   5.0,  0.0, 0.0),
+        ("End User (5%)",                              "OBO",    5.0,  0.0, 0.0),
+        ("End User (5%)",                              "CABUR",  5.0,  0.0, 0.0),
+    ]
+    with conn.cursor() as cur:
+        cur.executemany(
+            """INSERT INTO reglas_descuento (tarifa_nombre, marca, desc_1, desc_2, desc_3)
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (tarifa_nombre, marca) DO NOTHING""",
+            reglas,
+        )
+    conn.commit()
+    print(f"Reglas de descuento: {len(reglas)} reglas cargadas (ON CONFLICT DO NOTHING).")
+
+
 if __name__ == "__main__":
     if not DATABASE_URL:
         print("ERROR: DATABASE_URL no configurada.")
@@ -176,8 +212,9 @@ if __name__ == "__main__":
     try:
         create_tables(conn)
         insert_seed_data(conn)
+        insert_reglas_descuento(conn)
         print(f"Base de datos lista.")
-        print("Tablas: productos_catalogo, clientes_prospectos, oportunidades_ventas, interacciones")
+        print("Tablas: productos_catalogo, clientes_prospectos, oportunidades_ventas, interacciones, reglas_descuento")
     finally:
         conn.close()
 
