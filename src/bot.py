@@ -6,7 +6,7 @@ Recibe requerimientos en lenguaje natural y devuelve propuesta PDF + email draft
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -28,13 +28,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-_propuesta_counter = 0
 
 
 def _siguiente_numero() -> str:
-    global _propuesta_counter
-    _propuesta_counter += 1
-    return f"{date.today().year}-{_propuesta_counter:03d}"
+    """Número de propuesta basado en timestamp — único y no se resetea en reinicios."""
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -56,75 +54,165 @@ async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• \"Relé para parada de emergencia PL e, planta Arcor Córdoba\"\n"
         "• \"Bandejas portacables para tablero 2m x 60cm, proyecto Molinos\"\n"
         "• \"Sistema configurable para 4 funciones de seguridad simultáneas\"\n\n"
-        "Podés incluir el nombre del cliente para personalizar el email."
+        "Podés incluir el nombre del cliente para personalizar el email.\n\n"
+        "Usá /tarifa para ver o cambiar la tarifa de descuento activa."
     )
 
 
+async def cmd_tarifa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra o establece la tarifa de descuento activa para esta sesión."""
+    args = context.args  # texto después de /tarifa
+
+    if not args:
+        tarifa_actual = context.user_data.get("tarifa")
+        if tarifa_actual:
+            await update.message.reply_text(
+                f"Tarifa activa: *{tarifa_actual}*\n\n"
+                "Para cambiarla: /tarifa <nombre exacto>\n"
+                "Para ver opciones enviá: /tarifa lista",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                "Sin tarifa activa — las cotizaciones usan precio de lista.\n\n"
+                "Para activar: /tarifa <nombre exacto>\n"
+                "Para ver opciones: /tarifa lista"
+            )
+        return
+
+    nombre = " ".join(args).strip()
+
+    if nombre.lower() == "lista":
+        await update.message.reply_text(
+            "Tarifas disponibles (copiá el nombre exacto):\n\n"
+            "• Dist. Principal - Pilz 25% - Resto 30+10\n"
+            "• 30% OBO - Cabur - Pilz 0%\n"
+            "• Pilz System Partner - 30+10\n"
+            "• End User (5%)\n\n"
+            "Ejemplo: /tarifa Pilz System Partner - 30+10"
+        )
+        return
+
+    context.user_data["tarifa"] = nombre
+    await update.message.reply_text(
+        f"Tarifa establecida: *{nombre}*\n"
+        "Las próximas cotizaciones usarán esta tarifa.",
+        parse_mode="Markdown"
+    )
+
+
+async def _enviar_propuesta(update: Update, propuesta: dict) -> None:
+    """Genera y envía el PDF (o fallback texto) + borrador de email."""
+    numero = _siguiente_numero()
+    cliente_nombre = propuesta.get("cliente", "cliente")
+
+    pdf_enviado = False
+    try:
+        from src.pdf_generator import generar_pdf  # noqa: PLC0415
+        pdf_bytes = generar_pdf(propuesta, numero_propuesta=numero)
+        nombre_archivo = (
+            f"propuesta_{cliente_nombre.replace(' ', '_')}"
+            f"_{date.today().isoformat()}.pdf"
+        )
+        await update.message.reply_document(
+            document=BytesIO(pdf_bytes),
+            filename=nombre_archivo,
+            caption=(
+                f"Propuesta N° {numero} — {cliente_nombre}\n"
+                f"Total: USD {propuesta.get('total_usd', 0):.2f}"
+            )
+        )
+        pdf_enviado = True
+    except Exception as pdf_err:
+        logger.warning("PDF no disponible en este entorno (%s). Enviando texto.", pdf_err)
+
+    if not pdf_enviado:
+        productos_txt = "\n".join(
+            f"  • `{p['sku']}` × {p['cantidad']} — USD {p['precio_usd']:.2f}\n"
+            f"    {p['descripcion']}"
+            for p in propuesta.get("productos", [])
+        )
+        await update.message.reply_text(
+            f"*Propuesta N° {numero} — {cliente_nombre}*\n\n"
+            f"*Productos:*\n{productos_txt}\n\n"
+            f"*Total: USD {propuesta.get('total_usd', 0):.2f}*\n"
+            f"Norma: {propuesta.get('norma_aplicable', '')}\n"
+            f"Entrega: {propuesta.get('tiempo_entrega_dias', 30)} días\n\n"
+            f"_(PDF disponible en producción Railway)_",
+            parse_mode="Markdown"
+        )
+
+    email_draft = propuesta.get("email_draft", "")
+    if email_draft:
+        await update.message.reply_text(
+            f"*Borrador de email:*\n\n{email_draft}",
+            parse_mode="Markdown"
+        )
+
+
 async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler principal: procesa el requerimiento y devuelve PDF + email."""
+    """Handler principal: procesa el requerimiento y devuelve PDF + email.
+
+    Flujo conversacional:
+    - Si el cotizador necesita más info, envía preguntas al usuario y espera.
+    - La respuesta del usuario se concatena al requerimiento original y se reintenta.
+    - El contexto se limpia después de entregar la propuesta o ante un nuevo requerimiento.
+    """
     texto = update.message.text.strip()
     if not texto:
         return
 
-    await update.message.reply_text(
-        "Procesando requerimiento... Consultando catálogo y generando propuesta."
-    )
+    tarifa_activa = context.user_data.get("tarifa")
 
-    try:
-        propuesta = await generar_cotizacion(
-            requerimiento=texto,
-            cliente="No especificado"
+    # ── Flujo conversacional: si hay preguntas pendientes, combinar respuesta ──
+    ctx_pendiente = context.user_data.get("cotizacion_pendiente")
+    if ctx_pendiente:
+        requerimiento_completo = (
+            ctx_pendiente["requerimiento_original"]
+            + "\n\nRespuestas a las preguntas:\n"
+            + texto
+        )
+        cliente = ctx_pendiente.get("cliente", "No especificado")
+        context.user_data.pop("cotizacion_pendiente", None)
+        await update.message.reply_text("Procesando con la información adicional...")
+    else:
+        requerimiento_completo = texto
+        cliente = "No especificado"
+        await update.message.reply_text(
+            "Consultando catálogo y preparando propuesta..."
         )
 
-        numero = _siguiente_numero()
-        cliente_nombre = propuesta.get("cliente", "cliente")
+    try:
+        resultado = await generar_cotizacion(
+            requerimiento=requerimiento_completo,
+            cliente=cliente,
+            tarifa_nombre=tarifa_activa,
+        )
 
-        # Intentar generar PDF (falla en Windows sin GTK3, funciona en Railway/Linux)
-        pdf_enviado = False
-        try:
-            from src.pdf_generator import generar_pdf  # noqa: PLC0415
-            pdf_bytes = generar_pdf(propuesta, numero_propuesta=numero)
-            nombre_archivo = (
-                f"propuesta_{cliente_nombre.replace(' ', '_')}"
-                f"_{date.today().isoformat()}.pdf"
-            )
-            await update.message.reply_document(
-                document=BytesIO(pdf_bytes),
-                filename=nombre_archivo,
-                caption=(
-                    f"Propuesta N° {numero} — {cliente_nombre}\n"
-                    f"Total: USD {propuesta.get('total_usd', 0):.2f}"
-                )
-            )
-            pdf_enviado = True
-        except Exception as pdf_err:
-            logger.warning("PDF no disponible en este entorno (%s). Enviando texto.", pdf_err)
+        # ── Respuesta tipo: preguntas de clarificación ─────────────────────────
+        if resultado.get("tipo") == "preguntas":
+            preguntas = resultado.get("preguntas", [])
+            resumen = resultado.get("resumen_requerimiento", "")
 
-        # Fallback: resumen en texto si no hay PDF (ej. Windows local)
-        if not pdf_enviado:
-            productos_txt = "\n".join(
-                f"  • {p['sku']} × {p['cantidad']} — USD {p['precio_usd']:.2f}\n"
-                f"    {p['descripcion']}"
-                for p in propuesta.get("productos", [])
-            )
-            await update.message.reply_text(
-                f"*Propuesta N° {numero} — {cliente_nombre}*\n\n"
-                f"*Productos:*\n{productos_txt}\n\n"
-                f"*Total: USD {propuesta.get('total_usd', 0):.2f}*\n"
-                f"Norma: {propuesta.get('norma_aplicable', '')}\n"
-                f"Entrega: {propuesta.get('tiempo_entrega_dias', 30)} días\n\n"
-                f"_(PDF disponible en producción Railway)_",
-                parse_mode="Markdown"
-            )
+            # Guardar contexto para la próxima respuesta
+            context.user_data["cotizacion_pendiente"] = {
+                "requerimiento_original": requerimiento_completo,
+                "cliente": cliente,
+            }
 
-        email_draft = propuesta.get("email_draft", "")
-        if email_draft:
-            await update.message.reply_text(
-                f"*Borrador de email:*\n\n{email_draft}",
-                parse_mode="Markdown"
-            )
+            preguntas_txt = "\n".join(f"{i+1}. {p}" for i, p in enumerate(preguntas))
+            msg = ""
+            if resumen:
+                msg += f"Entendí: _{resumen}_\n\n"
+            msg += f"Necesito un poco más de información:\n\n{preguntas_txt}\n\nRespondé todo en un solo mensaje."
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        # ── Respuesta tipo: propuesta completa ────────────────────────────────
+        await _enviar_propuesta(update, resultado)
 
     except Exception as e:
+        context.user_data.pop("cotizacion_pendiente", None)
         logger.error("Error procesando requerimiento: %s", e, exc_info=True)
         await update.message.reply_text(
             f"Error al generar la propuesta: {e}\n"
@@ -139,6 +227,7 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ayuda", cmd_ayuda))
+    app.add_handler(CommandHandler("tarifa", cmd_tarifa))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_requerimiento))
 
     logger.info("Bot Fachmann iniciado...")
