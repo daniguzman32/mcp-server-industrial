@@ -47,14 +47,15 @@ DDL = [
     )""",
     # Migraciones idempotentes para DBs existentes
     "ALTER TABLE clientes_prospectos ADD COLUMN IF NOT EXISTS contacto_cargo TEXT",
-    # Normalizar valores viejos de estado_lead antes de aplicar el nuevo constraint
+    # 1. Soltar el constraint viejo PRIMERO (así los UPDATEs no lo violan)
+    "ALTER TABLE clientes_prospectos DROP CONSTRAINT IF EXISTS clientes_prospectos_estado_lead_check",
+    # 2. Normalizar valores legacy a los nuevos estados
     "UPDATE clientes_prospectos SET estado_lead = 'ganado'        WHERE estado_lead = 'cliente_activo'",
     "UPDATE clientes_prospectos SET estado_lead = 'oferta'        WHERE estado_lead = 'en_negociacion'",
     "UPDATE clientes_prospectos SET estado_lead = 'calificado'    WHERE estado_lead = 'contactado'",
     "UPDATE clientes_prospectos SET estado_lead = 'nuevo_cliente' WHERE estado_lead = 'prospecto'",
     "UPDATE clientes_prospectos SET estado_lead = 'nuevo_cliente' WHERE estado_lead NOT IN ('nuevo_cliente','calificado','oferta','ganado','cancelado','perdido')",
-    # Actualizar constraint de estado_lead con los nuevos valores
-    "ALTER TABLE clientes_prospectos DROP CONSTRAINT IF EXISTS clientes_prospectos_estado_lead_check",
+    # 3. Recrear el constraint con los valores correctos
     """ALTER TABLE clientes_prospectos ADD CONSTRAINT clientes_prospectos_estado_lead_check
        CHECK(estado_lead IN ('nuevo_cliente','calificado','oferta','ganado','cancelado','perdido'))""",
     """CREATE TABLE IF NOT EXISTS oportunidades_ventas (
