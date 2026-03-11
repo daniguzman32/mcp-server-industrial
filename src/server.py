@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 Servidor MCP para Fachmann — Gestión comercial B2B de automatización industrial.
-Marcas representadas: PILZ, OBO Bettermann, CABUR.
+Marcas representadas: PILZ, OBO Bettermann, CABUR, IDEM Safety.
 
 Herramientas disponibles:
-  - fachmann_buscar_catalogo         Busca productos por texto y/o marca
+  - fachmann_buscar_catalogo          Busca productos por texto y/o marca
   - fachmann_consultar_disponibilidad Precio, stock y entrega por SKU
   - fachmann_buscar_contexto_cliente  Perfil + historial completo de un cliente
   - fachmann_registrar_interaccion    Guarda reunión / email / llamada en el CRM
+  - fachmann_agregar_contacto         Crea un nuevo cliente o prospecto
+  - fachmann_actualizar_contacto      Actualiza datos de un contacto existente
 """
 
 import json
@@ -25,8 +27,9 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-MARCAS_VALIDAS = {"PILZ", "OBO", "CABUR"}
+MARCAS_VALIDAS = {"PILZ", "OBO", "CABUR", "IDEM SAFETY"}
 TIPOS_INTERACCION = {"reunion", "email", "llamada", "whatsapp", "nota"}
+ESTADOS_LEAD_VALIDOS = {"nuevo_cliente", "calificado", "oferta", "ganado", "cancelado", "perdido"}
 
 
 # ── Lifespan: pool de conexiones a PostgreSQL ─────────────────────────────────
@@ -128,6 +131,129 @@ class RegistrarInteraccionInput(BaseModel):
         v_lower = v.strip().lower()
         if v_lower not in TIPOS_INTERACCION:
             raise ValueError(f"Tipo inválido '{v}'. Opciones: {', '.join(sorted(TIPOS_INTERACCION))}.")
+        return v_lower
+
+
+class AgregarContactoInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    razon_social: str = Field(
+        ...,
+        description="Nombre de la empresa o razón social del contacto",
+        min_length=2,
+        max_length=200,
+    )
+    contacto_nombre: Optional[str] = Field(
+        default=None,
+        description="Nombre y apellido del contacto principal",
+        max_length=200,
+    )
+    contacto_cargo: Optional[str] = Field(
+        default=None,
+        description="Cargo o puesto del contacto (ej. 'Jefe de Mantenimiento', 'Gerente de Compras')",
+        max_length=100,
+    )
+    contacto_email: Optional[str] = Field(
+        default=None,
+        description="Email del contacto",
+        max_length=200,
+    )
+    contacto_telefono: Optional[str] = Field(
+        default=None,
+        description="Teléfono del contacto",
+        max_length=50,
+    )
+    industria: Optional[str] = Field(
+        default=None,
+        description="Sector o industria (ej. 'Automotriz', 'Alimentos', 'Oil & Gas')",
+        max_length=100,
+    )
+    estado_lead: str = Field(
+        default="nuevo_cliente",
+        description="Estado del lead: 'nuevo_cliente', 'calificado', 'oferta', 'ganado', 'cancelado', 'perdido'",
+    )
+    linkedin_url: Optional[str] = Field(
+        default=None,
+        description="URL del perfil LinkedIn de la empresa o contacto",
+        max_length=300,
+    )
+    notas: Optional[str] = Field(
+        default=None,
+        description="Notas internas sobre el contacto o empresa",
+        max_length=2000,
+    )
+
+    @field_validator("estado_lead")
+    @classmethod
+    def validate_estado_lead(cls, v: str) -> str:
+        v_lower = v.strip().lower()
+        if v_lower not in ESTADOS_LEAD_VALIDOS:
+            raise ValueError(f"Estado inválido '{v}'. Opciones: {', '.join(sorted(ESTADOS_LEAD_VALIDOS))}.")
+        return v_lower
+
+
+class ActualizarContactoInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    cliente_id: int = Field(
+        ...,
+        description="ID numérico del cliente a actualizar. Obtenerlo con fachmann_buscar_contexto_cliente.",
+        ge=1,
+    )
+    razon_social: Optional[str] = Field(
+        default=None,
+        description="Nuevo nombre de la empresa o razón social",
+        min_length=2,
+        max_length=200,
+    )
+    contacto_nombre: Optional[str] = Field(
+        default=None,
+        description="Nombre y apellido del contacto principal",
+        max_length=200,
+    )
+    contacto_cargo: Optional[str] = Field(
+        default=None,
+        description="Cargo o puesto del contacto",
+        max_length=100,
+    )
+    contacto_email: Optional[str] = Field(
+        default=None,
+        description="Email del contacto",
+        max_length=200,
+    )
+    contacto_telefono: Optional[str] = Field(
+        default=None,
+        description="Teléfono del contacto",
+        max_length=50,
+    )
+    industria: Optional[str] = Field(
+        default=None,
+        description="Sector o industria",
+        max_length=100,
+    )
+    estado_lead: Optional[str] = Field(
+        default=None,
+        description="Estado del lead: 'nuevo_cliente', 'calificado', 'oferta', 'ganado', 'cancelado', 'perdido'",
+    )
+    linkedin_url: Optional[str] = Field(
+        default=None,
+        description="URL del perfil LinkedIn",
+        max_length=300,
+    )
+    notas: Optional[str] = Field(
+        default=None,
+        description="Notas internas (reemplaza las existentes)",
+        max_length=2000,
+    )
+
+    @field_validator("estado_lead")
+    @classmethod
+    def validate_estado_lead(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v_lower = v.strip().lower()
+        if v_lower not in ESTADOS_LEAD_VALIDOS:
+            raise ValueError(f"Estado inválido '{v}'. Opciones: {', '.join(sorted(ESTADOS_LEAD_VALIDOS))}.")
         return v_lower
 
 
@@ -273,8 +399,8 @@ async def fachmann_buscar_contexto_cliente(params: BuscarContextoClienteInput, c
 
         async with pool.acquire() as conn:
             clientes_rows = await conn.fetch(
-                """SELECT id, razon_social, contacto_nombre, contacto_email, contacto_telefono,
-                          industria, estado_lead, linkedin_url, notas, created_at
+                """SELECT id, razon_social, contacto_nombre, contacto_cargo, contacto_email,
+                          contacto_telefono, industria, estado_lead, linkedin_url, notas, created_at
                    FROM clientes_prospectos
                    WHERE razon_social ILIKE $1 OR contacto_nombre ILIKE $2
                    ORDER BY razon_social""",
@@ -369,6 +495,159 @@ async def fachmann_registrar_interaccion(params: RegistrarInteraccionInput, ctx:
                 "tipo": params.tipo,
                 "fecha": fecha,
                 "notas": params.notas,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        return _db_error(e)
+
+
+@mcp.tool(
+    name="fachmann_agregar_contacto",
+    annotations={
+        "title": "Agregar Nuevo Contacto o Empresa al CRM",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def fachmann_agregar_contacto(params: AgregarContactoInput, ctx: Context) -> str:
+    """Crea un nuevo cliente o prospecto en el CRM de Fachmann.
+
+    Usar cuando se identifica un nuevo lead o se establece primer contacto con una empresa.
+    Si el contacto ya existe, usar fachmann_actualizar_contacto en su lugar.
+
+    Args:
+        params (AgregarContactoInput):
+            - razon_social (str): Nombre de la empresa (requerido)
+            - contacto_nombre (Optional[str]): Nombre del contacto principal
+            - contacto_cargo (Optional[str]): Cargo del contacto
+            - contacto_email (Optional[str]): Email
+            - contacto_telefono (Optional[str]): Teléfono
+            - industria (Optional[str]): Sector (ej. 'Automotriz', 'Alimentos')
+            - estado_lead (str): Estado del lead (default: 'nuevo_cliente')
+            - linkedin_url (Optional[str]): URL LinkedIn
+            - notas (Optional[str]): Notas internas
+
+    Returns:
+        str: JSON de confirmación con el cliente_id asignado.
+    """
+    try:
+        pool: asyncpg.Pool = ctx.request_context.lifespan_state["db"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        async with pool.acquire() as conn:
+            cliente_id = await conn.fetchval(
+                """INSERT INTO clientes_prospectos
+                   (razon_social, contacto_nombre, contacto_cargo, contacto_email,
+                    contacto_telefono, industria, estado_lead, linkedin_url, notas,
+                    created_at, updated_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                   RETURNING id""",
+                params.razon_social,
+                params.contacto_nombre,
+                params.contacto_cargo,
+                params.contacto_email,
+                params.contacto_telefono,
+                params.industria,
+                params.estado_lead,
+                params.linkedin_url,
+                params.notas,
+                now,
+                now,
+            )
+
+        return json.dumps(
+            {
+                "success": True,
+                "cliente_id": cliente_id,
+                "razon_social": params.razon_social,
+                "estado_lead": params.estado_lead,
+                "mensaje": f"Contacto '{params.razon_social}' creado con ID {cliente_id}.",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        return _db_error(e)
+
+
+@mcp.tool(
+    name="fachmann_actualizar_contacto",
+    annotations={
+        "title": "Actualizar Datos de un Contacto Existente",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def fachmann_actualizar_contacto(params: ActualizarContactoInput, ctx: Context) -> str:
+    """Actualiza uno o más campos de un cliente o prospecto existente en el CRM.
+
+    Solo actualiza los campos que se provean — los campos omitidos no se modifican.
+    El cliente_id se obtiene previamente con fachmann_buscar_contexto_cliente.
+
+    Args:
+        params (ActualizarContactoInput):
+            - cliente_id (int): ID del cliente a actualizar (requerido)
+            - razon_social / contacto_nombre / contacto_cargo / contacto_email /
+              contacto_telefono / industria / estado_lead / linkedin_url / notas:
+              Todos opcionales. Solo se actualizan los que se pasen.
+
+    Returns:
+        str: JSON de confirmación con los campos actualizados.
+    """
+    try:
+        pool: asyncpg.Pool = ctx.request_context.lifespan_state["db"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        campos = {
+            "razon_social": params.razon_social,
+            "contacto_nombre": params.contacto_nombre,
+            "contacto_cargo": params.contacto_cargo,
+            "contacto_email": params.contacto_email,
+            "contacto_telefono": params.contacto_telefono,
+            "industria": params.industria,
+            "estado_lead": params.estado_lead,
+            "linkedin_url": params.linkedin_url,
+            "notas": params.notas,
+        }
+        actualizados = {k: v for k, v in campos.items() if v is not None}
+
+        if not actualizados:
+            return "Error: Debe proveer al menos un campo para actualizar."
+
+        async with pool.acquire() as conn:
+            cliente_row = await conn.fetchrow(
+                "SELECT razon_social FROM clientes_prospectos WHERE id = $1",
+                params.cliente_id,
+            )
+            if cliente_row is None:
+                return (
+                    f"Error: No existe un cliente con ID {params.cliente_id}. "
+                    "Use fachmann_buscar_contexto_cliente para obtener el ID correcto."
+                )
+
+            set_parts = [f"{col} = ${i + 1}" for i, col in enumerate(actualizados)]
+            set_parts.append(f"updated_at = ${len(actualizados) + 1}")
+            valores = list(actualizados.values()) + [now, params.cliente_id]
+
+            await conn.execute(
+                f"UPDATE clientes_prospectos SET {', '.join(set_parts)} WHERE id = ${len(valores)}",
+                *valores,
+            )
+
+        return json.dumps(
+            {
+                "success": True,
+                "cliente_id": params.cliente_id,
+                "razon_social": cliente_row["razon_social"],
+                "campos_actualizados": list(actualizados.keys()),
             },
             indent=2,
             ensure_ascii=False,

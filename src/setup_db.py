@@ -34,16 +34,23 @@ DDL = [
         id                SERIAL PRIMARY KEY,
         razon_social      TEXT NOT NULL,
         contacto_nombre   TEXT,
+        contacto_cargo    TEXT,
         contacto_email    TEXT,
         contacto_telefono TEXT,
         industria         TEXT,
-        estado_lead       TEXT DEFAULT 'prospecto'
-                          CHECK(estado_lead IN ('prospecto','contactado','en_negociacion','cliente_activo','perdido')),
+        estado_lead       TEXT DEFAULT 'nuevo_cliente'
+                          CHECK(estado_lead IN ('nuevo_cliente','calificado','oferta','ganado','cancelado','perdido')),
         linkedin_url      TEXT,
         notas             TEXT,
         created_at        TEXT DEFAULT NOW()::TEXT,
         updated_at        TEXT DEFAULT NOW()::TEXT
     )""",
+    # Migraciones idempotentes para DBs existentes
+    "ALTER TABLE clientes_prospectos ADD COLUMN IF NOT EXISTS contacto_cargo TEXT",
+    # Actualizar constraint de estado_lead con los nuevos valores
+    "ALTER TABLE clientes_prospectos DROP CONSTRAINT IF EXISTS clientes_prospectos_estado_lead_check",
+    """ALTER TABLE clientes_prospectos ADD CONSTRAINT clientes_prospectos_estado_lead_check
+       CHECK(estado_lead IN ('nuevo_cliente','calificado','oferta','ganado','cancelado','perdido'))""",
     """CREATE TABLE IF NOT EXISTS oportunidades_ventas (
         id                    SERIAL PRIMARY KEY,
         cliente_id            INTEGER NOT NULL REFERENCES clientes_prospectos(id),
@@ -127,13 +134,13 @@ def insert_seed_data(conn) -> None:
         )
 
         clientes = [
-            ("Arcor S.A.I.C.",                  "Ing. Roberto Martínez",  "r.martinez@arcor.com",         "+54 9 351 555-0101", "Alimentos y Bebidas",        "cliente_activo",   "https://linkedin.com/in/roberto-martinez-arcor",    "Principal cliente PILZ. Planta packaging en Córdoba. Compras anuales ~USD 30k."),
-            ("Techint Ingeniería y Construcción","Lic. Andrea Soto",       "andrea.soto@techint.com",      "+54 9 11 555-0202",  "Siderurgia / Construcción",  "en_negociacion",   "https://linkedin.com/in/andrea-soto-techint",       "Proyecto tablero distribución planta San Nicolás. Esperan aprobación presupuesto marzo."),
-            ("Grupo Fate S.A.",                  "Ing. Carlos Pérez",      "c.perez@fate.com.ar",          "+54 9 11 555-0303",  "Automotriz",                 "contactado",       "https://linkedin.com/in/carlos-perez-fate",         "Interesados en relés de seguridad para prensas. Tienen presupuesto Q2 aprobado."),
-            ("Metalúrgica Santa Rosa",           "Sr. Hugo Rodríguez",     "hrodriguez@msrosa.com.ar",     "+54 9 261 555-0404", "Metalurgia",                 "prospecto",        None,                                                "Tablerista mediano, 5 empleados. Actualmente trabajan con Siemens. Visitar en abril."),
-            ("Sistemi Integrazione SRL",         "Ing. Valentina Bruni",   "v.bruni@sistemi.com.ar",       "+54 9 11 555-0505",  "Integradores de Sistemas",   "cliente_activo",   "https://linkedin.com/in/valentina-bruni-sistemi",   "Integrador clave. Proyectos en industria farmacéutica. Negociando descuento por volumen."),
-            ("Molinos Río de la Plata",          "Ing. Diego Fernández",   "d.fernandez@molinos.com",      "+54 9 11 555-0606",  "Alimentos",                  "en_negociacion",   "https://linkedin.com/in/diego-fernandez-molinos",   "Renovación tableros de distribución. OBO + CABUR. Solicitan ingeniería de tablero."),
-            ("Laboratorio Roemmers S.A.",        "Lic. Sofía Castro",      "s.castro@roemmers.com.ar",     "+54 9 11 555-0707",  "Farmacéutica",               "prospecto",        "https://linkedin.com/in/sofia-castro-roemmers",     "Nuevo proyecto GMP Zona Libre. Requieren certificación ATEX. Contactar tras feria ExpoAgro."),
+            ("Arcor S.A.I.C.",                  "Ing. Roberto Martínez",  "r.martinez@arcor.com",         "+54 9 351 555-0101", "Alimentos y Bebidas",        "ganado",        "https://linkedin.com/in/roberto-martinez-arcor",    "Principal cliente PILZ. Planta packaging en Córdoba. Compras anuales ~USD 30k."),
+            ("Techint Ingeniería y Construcción","Lic. Andrea Soto",       "andrea.soto@techint.com",      "+54 9 11 555-0202",  "Siderurgia / Construcción",  "oferta",        "https://linkedin.com/in/andrea-soto-techint",       "Proyecto tablero distribución planta San Nicolás. Esperan aprobación presupuesto marzo."),
+            ("Grupo Fate S.A.",                  "Ing. Carlos Pérez",      "c.perez@fate.com.ar",          "+54 9 11 555-0303",  "Automotriz",                 "calificado",    "https://linkedin.com/in/carlos-perez-fate",         "Interesados en relés de seguridad para prensas. Tienen presupuesto Q2 aprobado."),
+            ("Metalúrgica Santa Rosa",           "Sr. Hugo Rodríguez",     "hrodriguez@msrosa.com.ar",     "+54 9 261 555-0404", "Metalurgia",                 "nuevo_cliente", None,                                                "Tablerista mediano, 5 empleados. Actualmente trabajan con Siemens. Visitar en abril."),
+            ("Sistemi Integrazione SRL",         "Ing. Valentina Bruni",   "v.bruni@sistemi.com.ar",       "+54 9 11 555-0505",  "Integradores de Sistemas",   "ganado",        "https://linkedin.com/in/valentina-bruni-sistemi",   "Integrador clave. Proyectos en industria farmacéutica. Negociando descuento por volumen."),
+            ("Molinos Río de la Plata",          "Ing. Diego Fernández",   "d.fernandez@molinos.com",      "+54 9 11 555-0606",  "Alimentos",                  "oferta",        "https://linkedin.com/in/diego-fernandez-molinos",   "Renovación tableros de distribución. OBO + CABUR. Solicitan ingeniería de tablero."),
+            ("Laboratorio Roemmers S.A.",        "Lic. Sofía Castro",      "s.castro@roemmers.com.ar",     "+54 9 11 555-0707",  "Farmacéutica",               "nuevo_cliente", "https://linkedin.com/in/sofia-castro-roemmers",     "Nuevo proyecto GMP Zona Libre. Requieren certificación ATEX. Contactar tras feria ExpoAgro."),
         ]
 
         cur.executemany(
