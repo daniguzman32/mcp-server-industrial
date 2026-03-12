@@ -5,10 +5,13 @@ técnica estructurada usando Claude API con function calling.
 """
 
 import json
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 import anthropic
 import asyncpg
@@ -393,11 +396,23 @@ async def llamar_claude(requerimiento: str, cliente: str, tarifa_nombre: Optiona
             for block in response.content:
                 if hasattr(block, "text") and block.text:
                     text = block.text.strip()
-                    # Quitar fences de código si los hay
-                    fence = re.search(r"```(?:json)?\s*(\{.*)", text, re.DOTALL)
+                    logger.info("Respuesta Claude (iter %d): %s", _iter, text[:500])
+
+                    # Intento 1: JSON limpio directo
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError:
+                        pass
+
+                    # Intento 2: extraer del fence ```json ... ```
+                    fence = re.search(r"```(?:json)?\s*(\{.*?)\s*```", text, re.DOTALL)
                     if fence:
-                        text = fence.group(1).rstrip().rstrip("`").rstrip()
-                    # Buscar el primer { y parsear con raw_decode (respeta anidamiento)
+                        try:
+                            return json.loads(fence.group(1))
+                        except json.JSONDecodeError:
+                            pass
+
+                    # Intento 3: raw_decode desde el primer {
                     start = text.find("{")
                     if start != -1:
                         try:
@@ -405,6 +420,8 @@ async def llamar_claude(requerimiento: str, cliente: str, tarifa_nombre: Optiona
                             return obj
                         except json.JSONDecodeError:
                             pass
+
+                    logger.error("No se pudo parsear JSON del bloque:\n%s", text)
 
             raise ValueError("Claude no devolvió JSON válido en la respuesta")
         else:
