@@ -82,6 +82,20 @@ Términos de búsqueda útiles en el catálogo:
 }
 ```
 
+### Cuando el catálogo no tiene el producto — devolvé este formato:
+```json
+{
+  "tipo": "sin_resultado",
+  "busquedas_realizadas": ["término 1", "término 2"],
+  "mensaje": "explicación breve de qué se buscó y no se encontró",
+  "alternativas": [
+    "Alternativa 1: descripción de solución posible con productos que SÍ están en el catálogo",
+    "Alternativa 2: otra opción si aplica"
+  ]
+}
+```
+Siempre intentá ofrecer al menos una alternativa con productos que sí estén en el catálogo antes de declarar sin_resultado.
+
 ### Cuando tenés todo — devolvé la propuesta:
 ```json
 {

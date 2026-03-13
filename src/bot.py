@@ -189,6 +189,21 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
             tarifa_nombre=tarifa_activa,
         )
 
+        # ── Respuesta tipo: sin resultado en catálogo ─────────────────────────
+        if resultado.get("tipo") == "sin_resultado":
+            mensaje = resultado.get("mensaje", "No se encontraron productos en el catálogo.")
+            alternativas = resultado.get("alternativas", [])
+            busquedas = resultado.get("busquedas_realizadas", [])
+
+            txt = f"No encontré ese producto en el catálogo.\n\n{mensaje}"
+            if busquedas:
+                txt += f"\n\nBúsquedas realizadas: {', '.join(busquedas)}"
+            if alternativas:
+                txt += "\n\n*Alternativas posibles:*\n" + "\n".join(f"• {a}" for a in alternativas)
+            txt += "\n\n¿Querés que cotice alguna de las alternativas, o tenés un SKU específico?"
+            await update.message.reply_text(txt, parse_mode="Markdown")
+            return
+
         # ── Respuesta tipo: preguntas de clarificación ─────────────────────────
         if resultado.get("tipo") == "preguntas":
             preguntas = resultado.get("preguntas", [])
