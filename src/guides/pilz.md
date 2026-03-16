@@ -1,103 +1,71 @@
-# Guía de Selección PILZ
+# Guía de Selección PILZ — Criterios para el cotizador
 
-## Familias de productos y cuándo usar cada una
+## PNOZ s — Relés de función fija
+**Cuándo:** una sola función de seguridad, presupuesto ajustado, no se requiere comunicación con PLC.
+**Parámetro clave:** número de circuitos de habilitación requeridos y si necesita temporización de rearme.
+- 1–2 circuitos, sin temporización → PNOZ s4 o s5
+- 1–2 circuitos + temporización de arranque → PNOZ s6
+- Control de dos manos (tipo IIIC) → PNOZ s9
+- Puerta con bloqueo de seguridad → PNOZ s10
+Todos alcanzan PL e / Cat 4. Tensiones: 24 VDC (más común), 110 VAC, 230 VAC.
+**Combinaciones:** recibe directamente contactos de E-stop, final de carrera, o señales OSSD de cortinas de luz IDEM.
 
-### PNOZ s (relés de seguridad de función fija)
-Relés compactos para una función de seguridad específica. Elección cuando la máquina tiene 1-2 funciones de seguridad y no requiere lógica configurable.
+## PNOZ XV — Relés universales
+**Cuándo:** misma función que PNOZ s pero cuando el cliente ya tiene XV instalados, o cuando se necesita seleccionar modo por DIP switch en campo.
+**Parámetro clave:** categoría de seguridad requerida.
+- PL c / Cat 2 → PNOZ XV1 (1 canal)
+- PL e / Cat 4 → PNOZ XV2 (2 canales, la opción estándar más versátil)
+- Control de dos manos → PNOZ XV3
+- Tapetes de seguridad / bordes sensibles → PNOZ XV4 (único PILZ para esas entradas)
+**Combinaciones:** PNOZ XV4 es el relé obligatorio para tapetes y bordes IDEM Safety.
 
-| Modelo | Aplicación principal | PL / Categoría |
-|--------|---------------------|----------------|
-| PNOZ s4 | Parada de emergencia, 1 circuito de habilitación | PL e / Cat 4 |
-| PNOZ s5 | Parada de emergencia + protección de resguardos, 2 circuitos | PL e / Cat 4 |
-| PNOZ s6 | E-stop + temporización de arranque, 2 circuitos | PL e / Cat 4 |
-| PNOZ s7 | E-stop + 3 circuitos de habilitación | PL e / Cat 4 |
-| PNOZ s9 | Control de dos manos (tipo IIIC), 2 circuitos | PL e / Cat 4 |
-| PNOZ s10 | Monitoreo de puerta con bloqueo, 2 circuitos | PL e / Cat 4 |
+## PNOZmulti 2 — Controlador configurable
+**Cuándo:** 3 o más funciones de seguridad simultáneas, o cuando se requiere diagnóstico por canal en HMI/SCADA, o integración con bus de campo (Profibus, Profinet, EtherNet/IP).
+**Parámetro clave:** número de funciones de seguridad + necesidad de comunicación industrial.
+- Módulo base PNOZ-M-B0: 4 entradas de seguridad, 2 salidas OSSD
+- Expansiones disponibles para I/O adicionales y comunicación
+PL e / Cat 4. Se programa con PNOZmulti Configurator (software gratuito de PILZ).
+**Combinaciones:** obligatorio cuando se usa muting (paso de producto en cortinas de luz), o cuando se combinan en una misma celda: E-stop + cortinas + puerta con bloqueo + rearme desde múltiples puntos.
 
-Tensiones disponibles: 24 VDC (más común), 110 VAC, 230 VAC.
-Tiempo de respuesta: ≤20 ms (salvo modelos con temporización).
+## PMCprotego — Monitor de velocidad y posición seguro
+**Cuándo:** la velocidad, posición o dirección del eje son parámetros de seguridad (modo ajuste, acceso con movimiento reducido).
+**Parámetro clave:** tipo de encoder (SinCos / HTL / TTL) y funciones requeridas.
+- SLS (límite de velocidad segura), SMS, SDI, SOS, SLP disponibles
+- SIL 2 / PL d–e
+**Combinaciones:** siempre se usa junto con un PNOZ s o PNOZmulti 2 que gestiona las salidas de habilitación. PMCprotego solo monitorea; el corte de potencia lo hace el relé aguas arriba.
 
-### PNOZ XV (relés universales)
-Relés universales que pueden configurarse para múltiples aplicaciones mediante DIP switches o software.
-
-| Modelo | Aplicación | PL / Cat |
-|--------|-----------|----------|
-| PNOZ XV1 | 1 canal, menor costo, guardas fijas | PL c / Cat 2 |
-| PNOZ XV2 | 2 canales, la opción más versátil, E-stop y guardas | PL e / Cat 4 |
-| PNOZ XV3 | Control de dos manos tipo IIIC | PL e / Cat 4 |
-| PNOZ XV4 | Tapete de seguridad y bordes sensibles | PL e / Cat 4 |
-
-### PNOZmulti 2 (controlador de seguridad configurable)
-Para máquinas con 3+ funciones de seguridad simultáneas o cuando se requiere diagnóstico centralizado. Se programa con PNOZmulti Configurator (software gratuito).
-
-- Módulo base: PNOZ-M-B0 (4 entradas de seguridad, 2 salidas OSSD)
-- Módulos de expansión: I/O adicionales, comunicación (Profibus, Profinet, EtherNet/IP)
-- Aplicaciones: líneas de producción, robots, prensas con múltiples zonas de seguridad
-- PL e / Cat 4 con arquitectura dual
-
-Cuándo elegir PNOZmulti sobre PNOZ s:
-- Más de 2 funciones de seguridad
-- Se requiere comunicación con PLC maestro
-- Se necesita diagnóstico de falla por canal
-
-### PMCprotego (monitoreo de velocidad y posición seguro)
-Para aplicaciones donde la velocidad, posición o dirección del movimiento son parámetros de seguridad.
-
-- Funciones: SLS (límite de velocidad segura), SMS (máxima velocidad segura), SDI (dirección segura), SOS (parada segura), SLP (posición límite segura)
-- Entradas encoder: SinCos, HTL, TTL, resolvers
-- SIL 2 / PL d-e
-- Aplicaciones: tornos, centros de mecanizado, prensas con modo ajuste
-
-### PSS 4000 (PLC de seguridad)
-Para sistemas de automatización segura a escala de planta o líneas completas.
-- SafetyNET p para comunicación distribuida
-- Cuando se requiere integrar seguridad y automatización estándar en un solo sistema
-- PL e / Cat 4
+## PSS 4000 — PLC de seguridad
+**Cuándo:** automatización segura a escala de línea o planta, cuando seguridad y control estándar deben integrarse en un único sistema con red SafetyNET p.
+**Parámetro clave:** complejidad del sistema (> 10 funciones de seguridad, I/O distribuidos, múltiples CPUs).
+No cotizar para aplicaciones de máquina individual — en ese caso PNOZmulti 2 es suficiente y más económico.
 
 ---
 
-## Lógica de selección por aplicación
+## Árbol de selección rápida
 
-**Parada de emergencia (E-stop)**
-- 1 función, presupuesto ajustado → PNOZ s4 o PNOZ XV2
-- Múltiples E-stops en serie → PNOZ s5 o PNOZmulti 2
+```
+¿Cuántas funciones de seguridad?
+├── 1–2 funciones
+│   ├── ¿Necesita comunicación industrial? → No → PNOZ s (más económico)
+│   └── ¿Prefiere universal/configurable?  → Sí → PNOZ XV2
+├── 3+ funciones o muting o bus de campo → PNOZmulti 2
+├── Monitoreo de velocidad de eje → PMCprotego (+ PNOZ s o PNOZmulti)
+└── Línea completa / planta → PSS 4000
 
-**Protección de resguardos / puertas**
-- Puerta con enclavamiento sin bloqueo → PNOZ XV2
-- Puerta con bloqueo (muting) → PNOZ s10 o PNOZmulti 2
-
-**Control de dos manos**
-- Función única → PNOZ s9 o PNOZ XV3
-- Con otras funciones simultáneas → PNOZmulti 2
-
-**Cortinas de luz / barreras ópticas (ESPE)**
-- El relé de seguridad recibe las señales OSSD de la cortina
-- Para 1 zona: PNOZ XV2
-- Para múltiples zonas con muting: PNOZmulti 2
-
-**Tapetes de seguridad**
-- PNOZ XV4 (diseñado específicamente para tapetes y bordes sensibles)
-
-**Monitoreo de velocidad**
-- PMCprotego DS (con encoder) o PMCprotego D (sin encoder, por frecuencia)
+¿Tipo de entrada del sensor?
+├── E-stop (contacto NC) → cualquier PNOZ s/XV
+├── Puerta (2 contactos NC) → PNOZ s5, s6, XV2
+├── Control dos manos → PNOZ s9, XV3
+├── Cortina de luz OSSD → PNOZ XV2 o PNOZmulti 2
+├── Tapete / borde sensible → PNOZ XV4 (obligatorio)
+└── Encoder de velocidad → PMCprotego
+```
 
 ---
 
-## Reglas de arquitectura ISO 13849-1
-
-| PL requerido | Arquitectura mínima | Relé típico |
-|-------------|--------------------|-|
-| PL c | Cat 2 (1 canal + test) | PNOZ XV1 |
-| PL d | Cat 3 (2 canales, sin detección de falla común) | PNOZ XV2 |
-| PL e | Cat 4 (2 canales + diagnóstico de falla) | PNOZ s4/s5/s6, PNOZ XV2, PNOZmulti 2 |
-
-Nota: Cat 4 / PL e requiere siempre dos canales de entrada independientes y monitoreo de fallas de causa común. Todos los PNOZ s y PNOZ XV2 cumplen esto de fábrica.
-
----
-
-## Términos de búsqueda en el catálogo para PILZ
-- Relés de seguridad: "relé seguridad", "PNOZ", "safety relay"
-- Control dos manos: "control dos manos", "two hand", "PNOZ s9"
-- Parada emergencia: "parada emergencia", "emergency stop", "PNOZ s4", "PNOZ s5"
-- Sistemas configurables: "configurable", "PNOZmulti", "PNOZ-M"
-- Velocidad: "velocidad", "PMCprotego", "speed monitor"
+## Qué no cubre PILZ (usar IDEM Safety en estos casos)
+- Interruptores de puerta / compuertas (enclavamientos mecánicos y sin contacto)
+- Cortinas de luz / barreras ópticas (ESPE)
+- Bordes sensibles y tapetes de seguridad ← el relé sigue siendo PILZ XV4
+- Tiradores de cable (pull-cord) para transportadores
+- Dispositivos para zonas ATEX
