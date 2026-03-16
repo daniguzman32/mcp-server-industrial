@@ -30,6 +30,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 MARCAS_VALIDAS = {"PILZ", "OBO", "CABUR", "IDEM SAFETY"}
 TIPOS_INTERACCION = {"reunion", "email", "llamada", "whatsapp", "nota"}
 ESTADOS_LEAD_VALIDOS = {"nuevo_cliente", "calificado", "oferta", "ganado", "cancelado", "perdido"}
+ETAPAS_OPORTUNIDAD = {"prospecting", "qualification", "proposal", "negotiation", "closed_won", "closed_lost"}
 
 
 # ── Lifespan: pool de conexiones a PostgreSQL ─────────────────────────────────
@@ -189,6 +190,62 @@ class AgregarContactoInput(BaseModel):
         v_lower = v.strip().lower()
         if v_lower not in ESTADOS_LEAD_VALIDOS:
             raise ValueError(f"Estado inválido '{v}'. Opciones: {', '.join(sorted(ESTADOS_LEAD_VALIDOS))}.")
+        return v_lower
+
+
+class GestionarOportunidadInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    oportunidad_id: Optional[int] = Field(
+        default=None,
+        description="ID de la oportunidad a actualizar. Omitir para crear una nueva.",
+        ge=1,
+    )
+    cliente_id: Optional[int] = Field(
+        default=None,
+        description="ID del cliente (requerido al crear). Obtener con fachmann_buscar_contexto_cliente.",
+        ge=1,
+    )
+    descripcion: Optional[str] = Field(
+        default=None,
+        description="Descripción del proyecto u oportunidad",
+        min_length=3,
+        max_length=500,
+    )
+    monto_usd: Optional[float] = Field(
+        default=None,
+        description="Valor estimado de la oportunidad en USD",
+        ge=0,
+    )
+    probabilidad_cierre: Optional[int] = Field(
+        default=None,
+        description="Probabilidad de cierre en porcentaje (0–100)",
+        ge=0,
+        le=100,
+    )
+    etapa: Optional[str] = Field(
+        default=None,
+        description="Etapa: 'prospecting', 'qualification', 'proposal', 'negotiation', 'closed_won', 'closed_lost'",
+    )
+    notas_tecnicas: Optional[str] = Field(
+        default=None,
+        description="Notas técnicas o comerciales de la oportunidad",
+        max_length=2000,
+    )
+    fecha_cierre_estimada: Optional[str] = Field(
+        default=None,
+        description="Fecha estimada de cierre (formato YYYY-MM-DD)",
+        max_length=10,
+    )
+
+    @field_validator("etapa")
+    @classmethod
+    def validate_etapa(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v_lower = v.strip().lower()
+        if v_lower not in ETAPAS_OPORTUNIDAD:
+            raise ValueError(f"Etapa inválida '{v}'. Opciones: {', '.join(sorted(ETAPAS_OPORTUNIDAD))}.")
         return v_lower
 
 
@@ -652,6 +709,124 @@ async def fachmann_actualizar_contacto(params: ActualizarContactoInput, ctx: Con
             indent=2,
             ensure_ascii=False,
         )
+
+    except Exception as e:
+        return _db_error(e)
+
+
+@mcp.tool(
+    name="fachmann_gestionar_oportunidad",
+    annotations={
+        "title": "Crear o Actualizar Oportunidad de Venta",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def fachmann_gestionar_oportunidad(params: GestionarOportunidadInput, ctx: Context) -> str:
+    """Crea una nueva oportunidad de venta o actualiza una existente en el pipeline.
+
+    Para crear: omitir oportunidad_id y proveer cliente_id + descripcion.
+    Para actualizar: proveer oportunidad_id y los campos a cambiar.
+
+    Etapas disponibles: prospecting → qualification → proposal → negotiation → closed_won / closed_lost.
+
+    Args:
+        params (GestionarOportunidadInput):
+            - oportunidad_id (Optional[int]): ID a actualizar, o None para crear
+            - cliente_id (Optional[int]): Requerido al crear
+            - descripcion, monto_usd, probabilidad_cierre, etapa, notas_tecnicas, fecha_cierre_estimada
+
+    Returns:
+        str: JSON de confirmación con el oportunidad_id.
+    """
+    try:
+        pool: asyncpg.Pool = ctx.request_context.lifespan_state["db"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        async with pool.acquire() as conn:
+            # ── Crear ──────────────────────────────────────────────────────────
+            if params.oportunidad_id is None:
+                if not params.cliente_id or not params.descripcion:
+                    return "Error: Para crear una oportunidad se requieren cliente_id y descripcion."
+
+                cliente_row = await conn.fetchrow(
+                    "SELECT razon_social FROM clientes_prospectos WHERE id = $1",
+                    params.cliente_id,
+                )
+                if cliente_row is None:
+                    return f"Error: No existe cliente con ID {params.cliente_id}."
+
+                oportunidad_id = await conn.fetchval(
+                    """INSERT INTO oportunidades_ventas
+                       (cliente_id, descripcion, monto_usd, probabilidad_cierre,
+                        etapa, notas_tecnicas, fecha_cierre_estimada, fecha_creacion, updated_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                       RETURNING id""",
+                    params.cliente_id,
+                    params.descripcion,
+                    params.monto_usd,
+                    params.probabilidad_cierre or 25,
+                    params.etapa or "prospecting",
+                    params.notas_tecnicas,
+                    params.fecha_cierre_estimada,
+                    now, now,
+                )
+                return json.dumps(
+                    {
+                        "success": True,
+                        "accion": "creada",
+                        "oportunidad_id": oportunidad_id,
+                        "cliente": cliente_row["razon_social"],
+                        "descripcion": params.descripcion,
+                        "etapa": params.etapa or "prospecting",
+                    },
+                    indent=2, ensure_ascii=False,
+                )
+
+            # ── Actualizar ─────────────────────────────────────────────────────
+            op_row = await conn.fetchrow(
+                """SELECT o.id, c.razon_social FROM oportunidades_ventas o
+                   JOIN clientes_prospectos c ON c.id = o.cliente_id
+                   WHERE o.id = $1""",
+                params.oportunidad_id,
+            )
+            if op_row is None:
+                return f"Error: No existe oportunidad con ID {params.oportunidad_id}."
+
+            campos = {
+                "descripcion": params.descripcion,
+                "monto_usd": params.monto_usd,
+                "probabilidad_cierre": params.probabilidad_cierre,
+                "etapa": params.etapa,
+                "notas_tecnicas": params.notas_tecnicas,
+                "fecha_cierre_estimada": params.fecha_cierre_estimada,
+            }
+            actualizados = {k: v for k, v in campos.items() if v is not None}
+
+            if not actualizados:
+                return "Error: Debe proveer al menos un campo para actualizar."
+
+            set_parts = [f"{col} = ${i + 1}" for i, col in enumerate(actualizados)]
+            set_parts.append(f"updated_at = ${len(actualizados) + 1}")
+            valores = list(actualizados.values()) + [now, params.oportunidad_id]
+
+            await conn.execute(
+                f"UPDATE oportunidades_ventas SET {', '.join(set_parts)} WHERE id = ${len(valores)}",
+                *valores,
+            )
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "accion": "actualizada",
+                    "oportunidad_id": params.oportunidad_id,
+                    "cliente": op_row["razon_social"],
+                    "campos_actualizados": list(actualizados.keys()),
+                },
+                indent=2, ensure_ascii=False,
+            )
 
     except Exception as e:
         return _db_error(e)

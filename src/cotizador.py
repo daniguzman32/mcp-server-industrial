@@ -9,6 +9,8 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,19 @@ DATABASE_URL = _raw_url.replace("postgres://", "postgresql://", 1)
 if "sslmode" not in DATABASE_URL:
     DATABASE_URL += "?sslmode=require"
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+
+# ── Guías técnicas de selección ───────────────────────────────────────────────
+
+def _cargar_guias() -> str:
+    guias_dir = Path(__file__).parent / "guides"
+    contenidos = []
+    for nombre in ["pilz.md", "idem_safety.md", "obo.md", "cabur.md"]:
+        ruta = guias_dir / nombre
+        if ruta.exists():
+            contenidos.append(ruta.read_text(encoding="utf-8"))
+    return "\n\n---\n\n".join(contenidos)
+
+_GUIAS_TECNICAS = _cargar_guias()
 
 SYSTEM_PROMPT_BASE = """Sos un experto técnico comercial de Fachmann, representante en Argentina de PILZ, OBO Bettermann, CABUR e IDEM Safety.
 
@@ -142,7 +157,14 @@ La función devuelve `estado_stock` con tres valores posibles:
 - **"parcial"**: hay stock pero insuficiente. `tiempo_entrega_estimado_dias = 28`. En `notas_tecnicas` indicá cuántas unidades son inmediatas y cuántas bajo pedido.
 
 El campo `tiempo_entrega_dias` de la propuesta debe reflejar el plazo más largo entre todos los productos.
-Si algún producto es parcial o sin stock, mencionalo en el `email_draft` con lenguaje profesional."""
+Si algún producto es parcial o sin stock, mencionalo en el `email_draft` con lenguaje profesional.
+
+## Guías técnicas de selección por marca
+
+Usá estas guías para elegir el producto correcto según el requerimiento, antes de buscarlo en el catálogo.
+Las guías indican cuándo usar cada familia, qué parámetros son clave y con qué se combina.
+
+""" + _GUIAS_TECNICAS
 
 TOOLS = [
     {
@@ -468,8 +490,58 @@ async def generar_cotizacion(
     Returns:
         dict con "tipo": "propuesta" o "tipo": "preguntas".
     """
-    return await llamar_claude(
+    resultado = await llamar_claude(
         requerimiento=requerimiento,
         cliente=cliente,
         tarifa_nombre=tarifa_nombre,
     )
+    if resultado.get("tipo") == "propuesta":
+        await _guardar_cotizacion(resultado, tarifa_nombre)
+    return resultado
+
+
+async def _guardar_cotizacion(propuesta: dict, tarifa_nombre: Optional[str]) -> None:
+    """Persiste la propuesta generada en la tabla cotizaciones."""
+    try:
+        async with _get_conn() as conn:
+            await conn.execute(
+                """INSERT INTO cotizaciones
+                   (cliente_nombre, requerimiento, productos_json, total_usd, tarifa_nombre, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6)""",
+                propuesta.get("cliente", "No especificado"),
+                propuesta.get("requerimiento", ""),
+                json.dumps(propuesta.get("productos", []), ensure_ascii=False),
+                propuesta.get("total_usd"),
+                tarifa_nombre,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+    except Exception as e:
+        logger.warning("No se pudo guardar la cotización en la BD: %s", e)
+
+
+async def buscar_cliente(empresa: str) -> list[dict]:
+    """Busca clientes por nombre y devuelve perfil + interacciones recientes + oportunidades."""
+    like = f"%{empresa}%"
+    async with _get_conn() as conn:
+        clientes = [dict(r) for r in await conn.fetch(
+            """SELECT id, razon_social, contacto_nombre, contacto_cargo, contacto_email,
+                      contacto_telefono, industria, estado_lead, notas, updated_at
+               FROM clientes_prospectos
+               WHERE razon_social ILIKE $1 OR contacto_nombre ILIKE $2
+               ORDER BY razon_social LIMIT 5""",
+            like, like,
+        )]
+        for c in clientes:
+            c["interacciones_recientes"] = [dict(r) for r in await conn.fetch(
+                """SELECT tipo, notas, fecha FROM interacciones
+                   WHERE cliente_id = $1 ORDER BY fecha DESC LIMIT 3""",
+                c["id"],
+            )]
+            c["oportunidades_activas"] = [dict(r) for r in await conn.fetch(
+                """SELECT descripcion, monto_usd, etapa, probabilidad_cierre, fecha_cierre_estimada
+                   FROM oportunidades_ventas
+                   WHERE cliente_id = $1 AND etapa NOT IN ('closed_won', 'closed_lost')
+                   ORDER BY probabilidad_cierre DESC""",
+                c["id"],
+            )]
+    return clientes

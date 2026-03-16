@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from src.cotizador import generar_cotizacion
+from src.cotizador import buscar_cliente, generar_cotizacion
 
 load_dotenv()
 
@@ -43,7 +43,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\"Prensa con control de dos manos, categoría 4, cliente Arcor\"\n\n"
         "Comandos:\n"
         "/start — este mensaje\n"
-        "/ayuda — ejemplos de requerimientos"
+        "/ayuda — ejemplos de requerimientos\n"
+        "/cliente <nombre> — perfil + historial de un cliente\n"
+        "/tarifa — ver o cambiar tarifa de descuento activa"
     )
 
 
@@ -99,6 +101,68 @@ async def cmd_tarifa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "Las próximas cotizaciones usarán esta tarifa.",
         parse_mode="Markdown"
     )
+
+
+async def cmd_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra el perfil completo de un cliente con historial e interacciones."""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: /cliente <nombre o parte del nombre>\n\nEjemplo: /cliente Arcor"
+        )
+        return
+
+    empresa = " ".join(args).strip()
+    await update.message.reply_text(f"Buscando '{empresa}'...")
+
+    try:
+        clientes = await buscar_cliente(empresa)
+    except Exception as e:
+        await update.message.reply_text(f"Error al buscar: {e}")
+        return
+
+    if not clientes:
+        await update.message.reply_text(f"No encontré clientes que coincidan con '{empresa}'.")
+        return
+
+    for c in clientes:
+        estado_emoji = {
+            "nuevo_cliente": "🆕", "calificado": "✅", "oferta": "📋",
+            "ganado": "🏆", "perdido": "❌", "cancelado": "🚫",
+        }.get(c.get("estado_lead", ""), "•")
+
+        lineas = [
+            f"*{c['razon_social']}* {estado_emoji} {c.get('estado_lead', '')}",
+        ]
+        if c.get("contacto_nombre"):
+            cargo = f" — {c['contacto_cargo']}" if c.get("contacto_cargo") else ""
+            lineas.append(f"Contacto: {c['contacto_nombre']}{cargo}")
+        if c.get("contacto_email"):
+            lineas.append(f"Email: {c['contacto_email']}")
+        if c.get("contacto_telefono"):
+            lineas.append(f"Tel: {c['contacto_telefono']}")
+        if c.get("industria"):
+            lineas.append(f"Industria: {c['industria']}")
+        if c.get("notas"):
+            lineas.append(f"\n_{c['notas']}_")
+
+        ops = c.get("oportunidades_activas", [])
+        if ops:
+            lineas.append("\n*Oportunidades activas:*")
+            for op in ops:
+                monto = f"USD {op['monto_usd']:,.0f}" if op.get("monto_usd") else "—"
+                lineas.append(
+                    f"  • {op['descripcion'][:60]} | {op['etapa']} | {monto} | {op['probabilidad_cierre']}%"
+                )
+
+        ints = c.get("interacciones_recientes", [])
+        if ints:
+            lineas.append("\n*Últimas interacciones:*")
+            for i in ints:
+                fecha = i["fecha"][:10] if i.get("fecha") else ""
+                lineas.append(f"  [{fecha}] {i['tipo'].upper()}: {i['notas'][:80]}")
+
+        await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
 
 async def _enviar_propuesta(update: Update, propuesta: dict) -> None:
@@ -243,6 +307,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ayuda", cmd_ayuda))
     app.add_handler(CommandHandler("tarifa", cmd_tarifa))
+    app.add_handler(CommandHandler("cliente", cmd_cliente))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_requerimiento))
 
     logger.info("Bot Fachmann iniciado...")

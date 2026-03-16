@@ -88,12 +88,23 @@ DDL = [
         desc_3          REAL    NOT NULL DEFAULT 0.0,
         UNIQUE(tarifa_nombre, marca)
     )""",
+    """CREATE TABLE IF NOT EXISTS cotizaciones (
+        id              SERIAL PRIMARY KEY,
+        cliente_nombre  TEXT    NOT NULL,
+        cliente_id      INTEGER REFERENCES clientes_prospectos(id),
+        requerimiento   TEXT    NOT NULL,
+        productos_json  TEXT,
+        total_usd       REAL,
+        tarifa_nombre   TEXT,
+        created_at      TEXT    DEFAULT NOW()::TEXT
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_productos_marca     ON productos_catalogo(marca)",
     "CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos_catalogo(categoria)",
     "CREATE INDEX IF NOT EXISTS idx_clientes_nombre     ON clientes_prospectos(razon_social)",
     "CREATE INDEX IF NOT EXISTS idx_interacciones_cli   ON interacciones(cliente_id)",
     "CREATE INDEX IF NOT EXISTS idx_oportunidades_cli   ON oportunidades_ventas(cliente_id)",
     "CREATE INDEX IF NOT EXISTS idx_reglas_tarifa       ON reglas_descuento(tarifa_nombre)",
+    "CREATE INDEX IF NOT EXISTS idx_cotizaciones_fecha  ON cotizaciones(created_at)",
 ]
 
 
