@@ -99,11 +99,33 @@ Términos de búsqueda útiles en el catálogo:
   "tipo": "preguntas",
   "resumen_requerimiento": "lo que entendiste del requerimiento hasta ahora",
   "preguntas": [
-    "¿Pregunta 1?",
-    "¿Pregunta 2?"
+    {
+      "texto": "¿Cuál es el Performance Level requerido?",
+      "contexto": "PL c = categoría 2 (un canal + test periódico). PL d = categoría 3 (2 canales redundantes) — estándar para prensas. PL e = categoría 4 (redundante + detección de fallas comunes).",
+      "opciones": ["PL c", "PL d", "PL e"],
+      "no_se_asuncion": "PL d (ISO 13849-1 §4.5.4 — mínimo recomendado para control de dos manos en prensas)",
+      "tipo_respuesta": "single_choice",
+      "unidad": null,
+      "codigo_parametro": "pl_requerido",
+      "nivel_criticidad": "alta",
+      "referencia_normativa": "ISO 13849-1",
+      "orden": 1
+    }
   ]
 }
 ```
+
+Reglas para las preguntas:
+- `texto`: la pregunta en forma natural (obligatorio)
+- `contexto`: micro-explicación técnica de las opciones para un usuario no experto (null si no aporta valor)
+- `opciones`: lista con mínimo 2 y máximo 5 opciones — el usuario elige con botones, no tipea
+- `no_se_asuncion`: valor que se asumirá si el usuario no sabe, con referencia normativa cuando aplica (null si no hay asunción razonable)
+- `tipo_respuesta`: siempre "single_choice" por ahora
+- `unidad`: unidad de medida si aplica (ej. "V", "A", "mm"), null si no
+- `codigo_parametro`: clave corta en snake_case sin espacios (ej. "tension_trabajo", "pl_requerido", "cantidad_funciones")
+- `nivel_criticidad`: "alta" si afecta selección de categoría de seguridad/norma, "media" si afecta modelo/familia, "baja" si es solo de configuración
+- `referencia_normativa`: norma corta (ej. "ISO 13849-1", "IEC 62061"), null si no aplica
+- `orden`: entero para ordenar las preguntas de más general a más específica (1 = primera)
 
 ### Cuando el catálogo no tiene el producto — devolvé este formato:
 ```json
@@ -218,13 +240,29 @@ TOOLS = [
 ]
 
 
+_pool: Optional[asyncpg.Pool] = None
+
+
+async def _ensure_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    return _pool
+
+
 @asynccontextmanager
 async def _get_conn():
-    conn = await asyncpg.connect(DATABASE_URL)
+    global _pool
     try:
-        yield conn
-    finally:
-        await conn.close()
+        pool = await _ensure_pool()
+        async with pool.acquire() as conn:
+            yield conn
+    except Exception:
+        # Pool stale (Railway reinició la DB u otro servicio). Reset y retry una vez.
+        _pool = None
+        pool = await _ensure_pool()
+        async with pool.acquire() as conn:
+            yield conn
 
 
 def _aplicar_descuento(precio_lista: float, d1: float, d2: float, d3: float) -> float:
