@@ -3,11 +3,13 @@ Telegram bot para el Cotizador Técnico Fachmann.
 Recibe requerimientos en lenguaje natural y devuelve propuesta PDF + email draft.
 """
 
+import asyncio
 import logging
 import os
 import re
 import sys
 import time
+from collections import defaultdict
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -16,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -35,8 +38,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-_TTL_SEGUNDOS = 1800  # 30 minutos
 
+_TTL_SEGUNDOS = 1800        # 30 minutos — expiración de estado del wizard
+_COTIZACION_TIMEOUT = 120   # segundos — timeout de llamada al cotizador
+
+# Rate limiting: máx 5 mensajes por usuario en 10 segundos
+_RATE_LIMIT_CALLS = 5
+_RATE_LIMIT_WINDOW = 10
+_user_timestamps: dict[int, list[float]] = defaultdict(list)
+
+
+# ── Helpers internos ──────────────────────────────────────────────────────────
 
 def _siguiente_numero() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -44,6 +56,31 @@ def _siguiente_numero() -> str:
 
 def _estado_expirado(ctx: dict) -> bool:
     return time.time() - ctx.get("timestamp", 0) > _TTL_SEGUNDOS
+
+
+def _rate_limited(user_id: int) -> bool:
+    """Retorna True si el usuario superó el límite de mensajes."""
+    now = time.time()
+    calls = [t for t in _user_timestamps[user_id] if now - t < _RATE_LIMIT_WINDOW]
+    _user_timestamps[user_id] = calls
+    if len(calls) >= _RATE_LIMIT_CALLS:
+        return True
+    _user_timestamps[user_id].append(now)
+    return False
+
+
+def _mensaje_error_amigable(e: Exception) -> str:
+    """Convierte una excepción técnica en un mensaje comprensible para el usuario."""
+    msg = str(e).lower()
+    if isinstance(e, asyncio.TimeoutError):
+        return "La consulta tardó demasiado. Intentá con un requerimiento más específico o usá /nueva."
+    if "429" in msg or "rate" in msg:
+        return "El servicio está ocupado en este momento. Esperá unos segundos y volvé a intentar."
+    if "connect" in msg or "connection" in msg or "errno 111" in msg:
+        return "Hubo un problema de conexión. Intentá de nuevo en unos segundos."
+    if "json" in msg or "parse" in msg:
+        return "Hubo un problema procesando la respuesta. Reformulá el requerimiento y volvé a intentar."
+    return "Algo salió mal. Si persiste, usá /nueva y reformulá el requerimiento."
 
 
 # ── Comandos ──────────────────────────────────────────────────────────────────
@@ -133,12 +170,13 @@ async def cmd_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     empresa = " ".join(args).strip()
-    await update.message.reply_text(f"Buscando '{empresa}'...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     try:
         clientes = await buscar_cliente(empresa)
     except Exception as e:
-        await update.message.reply_text(f"Error al buscar: {e}")
+        logger.error("Error buscando cliente '%s': %s", empresa, e, exc_info=True)
+        await update.message.reply_text("No pude consultar la base de datos. Intentá de nuevo.")
         return
 
     if not clientes:
@@ -299,19 +337,21 @@ async def _completar_cotizacion(message, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         requerimiento_completo = requerimiento
 
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+
     try:
-        resultado = await generar_cotizacion(
-            requerimiento=requerimiento_completo,
-            cliente=cliente,
-            tarifa_nombre=tarifa,
+        resultado = await asyncio.wait_for(
+            generar_cotizacion(
+                requerimiento=requerimiento_completo,
+                cliente=cliente,
+                tarifa_nombre=tarifa,
+            ),
+            timeout=_COTIZACION_TIMEOUT,
         )
         await _despachar_resultado(message, context, resultado, requerimiento_completo, cliente)
     except Exception as e:
         logger.error("Error completando cotización: %s", e, exc_info=True)
-        await message.reply_text(
-            f"Error al generar la propuesta: {e}\n"
-            "Intentá reformular el requerimiento o contactá al administrador."
-        )
+        await message.reply_text(_mensaje_error_amigable(e))
 
 
 async def _despachar_resultado(
@@ -451,6 +491,11 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
     if not texto:
         return
 
+    # Rate limiting
+    if _rate_limited(update.effective_user.id):
+        await update.message.reply_text("Estás enviando mensajes muy rápido. Esperá un momento.")
+        return
+
     # Si hay un wizard activo con una pregunta sin opciones (texto libre), procesar como respuesta
     ctx_pendiente = context.user_data.get("cotizacion_pendiente")
     if ctx_pendiente and not _estado_expirado(ctx_pendiente):
@@ -459,7 +504,6 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
         if idx < len(preguntas):
             pregunta = preguntas[idx]
             if not (pregunta.get("opciones") or pregunta.get("no_se_asuncion")):
-                # Respuesta en texto libre a una pregunta sin opciones
                 codigo = pregunta.get("codigo_parametro") or pregunta.get("texto", f"param_{idx}")[:40]
                 ctx_pendiente["respuestas"][codigo] = texto
                 ctx_pendiente["pregunta_actual"] = idx + 1
@@ -479,20 +523,38 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
 
     tarifa_activa = context.user_data.get("tarifa")
     await update.message.reply_text("Consultando catálogo y preparando propuesta...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     try:
-        resultado = await generar_cotizacion(
-            requerimiento=texto,
-            cliente="No especificado",
-            tarifa_nombre=tarifa_activa,
+        resultado = await asyncio.wait_for(
+            generar_cotizacion(
+                requerimiento=texto,
+                cliente="No especificado",
+                tarifa_nombre=tarifa_activa,
+            ),
+            timeout=_COTIZACION_TIMEOUT,
         )
         await _despachar_resultado(update.message, context, resultado, texto, "No especificado")
     except Exception as e:
         context.user_data.pop("cotizacion_pendiente", None)
         logger.error("Error procesando requerimiento: %s", e, exc_info=True)
-        await update.message.reply_text(
-            f"Error al generar la propuesta: {e}\n"
-            "Intentá reformular el requerimiento o contactá al administrador."
+        await update.message.reply_text(_mensaje_error_amigable(e))
+
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde a mensajes no-texto (fotos, stickers, voz, etc.)."""
+    await update.message.reply_text(
+        "Solo proceso mensajes de texto. Describí el requerimiento técnico en palabras.\n\n"
+        "Ejemplo: \"Relé de seguridad para parada de emergencia PL e, cliente Arcor\""
+    )
+
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler global de errores no capturados — evita que el bot muera en silencio."""
+    logger.error("Error no capturado: %s", context.error, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "Ocurrió un error inesperado. Usá /nueva para reiniciar si el problema persiste."
         )
 
 
@@ -503,6 +565,7 @@ def main() -> None:
         raise ValueError("TELEGRAM_TOKEN no configurado en .env")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ayuda", cmd_ayuda))
     app.add_handler(CommandHandler("tarifa", cmd_tarifa))
@@ -510,6 +573,9 @@ def main() -> None:
     app.add_handler(CommandHandler("nueva", cmd_nueva))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_requerimiento))
+    app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_media))
+
+    app.add_error_handler(handle_error)
 
     logger.info("Bot Fachmann iniciado...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
