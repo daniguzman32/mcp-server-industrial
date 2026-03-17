@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,8 @@ DATABASE_URL = _raw_url.replace("postgres://", "postgresql://", 1)
 if "sslmode" not in DATABASE_URL:
     DATABASE_URL += "?sslmode=require"
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+# Modelo de mayor calidad para propuestas finales (después del wizard o refinamientos)
+CLAUDE_MODEL_PROPUESTA = os.getenv("CLAUDE_MODEL_PROPUESTA", "claude-sonnet-4-6")
 
 # ── Guías técnicas de selección ───────────────────────────────────────────────
 
@@ -304,9 +307,17 @@ async def _ejecutar_listar_tarifas() -> list[dict]:
 
 
 _BUSCAR_LIMIT = 20
+_CACHE_TTL = 300  # 5 minutos — cache de búsquedas de catálogo por sesión
+_search_cache: dict = {}  # {(query_lower, marca): (timestamp, resultado)}
 
 
 async def _ejecutar_buscar_catalogo(query: str, marca: Optional[str] = None) -> dict:
+    cache_key = (query.lower().strip(), marca)
+    cached = _search_cache.get(cache_key)
+    if cached and (time.time() - cached[0]) < _CACHE_TTL:
+        logger.info("Cache hit — búsqueda: '%s' marca=%s", query, marca)
+        return cached[1]
+
     like = f"%{query}%"
     async with _get_conn() as conn:
         if marca:
@@ -332,11 +343,13 @@ async def _ejecutar_buscar_catalogo(query: str, marca: Optional[str] = None) -> 
                 like, like, like, like, _BUSCAR_LIMIT,
             )]
 
-    return {
+    resultado = {
         "total_mostrados": len(rows),
         "nota": f"Se muestran hasta {_BUSCAR_LIMIT} resultados. Refiná la búsqueda si no encontrás el producto.",
         "productos": rows,
     }
+    _search_cache[cache_key] = (time.time(), resultado)
+    return resultado
 
 
 _LEAD_TIME_SIN_STOCK_DIAS = 28  # 4 semanas para productos bajo pedido
@@ -440,9 +453,15 @@ def _build_system_prompt(tarifa_nombre: Optional[str]) -> str:
 _MAX_ITER = 10
 
 
-async def llamar_claude(requerimiento: str, cliente: str, tarifa_nombre: Optional[str]) -> dict:
+async def llamar_claude(
+    requerimiento: str,
+    cliente: str,
+    tarifa_nombre: Optional[str],
+    model: Optional[str] = None,
+) -> dict:
     """Llama a Claude API con agentic loop hasta obtener la propuesta completa."""
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    modelo_a_usar = model or CLAUDE_MODEL
 
     messages = [
         {
@@ -453,7 +472,7 @@ async def llamar_claude(requerimiento: str, cliente: str, tarifa_nombre: Optiona
 
     for _iter in range(_MAX_ITER):
         response = client.messages.create(
-            model=CLAUDE_MODEL,
+            model=modelo_a_usar,
             max_tokens=4096,
             system=_build_system_prompt(tarifa_nombre),
             tools=TOOLS,
@@ -516,6 +535,7 @@ async def generar_cotizacion(
     requerimiento: str,
     cliente: str = "No especificado",
     tarifa_nombre: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> dict:
     """Punto de entrada principal del cotizador.
 
@@ -532,6 +552,7 @@ async def generar_cotizacion(
         requerimiento=requerimiento,
         cliente=cliente,
         tarifa_nombre=tarifa_nombre,
+        model=model,
     )
     if resultado.get("tipo") == "propuesta":
         await _guardar_cotizacion(resultado, tarifa_nombre)
@@ -583,3 +604,27 @@ async def buscar_cliente(empresa: str) -> list[dict]:
                 c["id"],
             )]
     return clientes
+
+
+async def registrar_interaccion(
+    cliente_nombre: str,
+    notas: str,
+    tipo: str = "cotizacion",
+) -> dict:
+    """Registra una interacción en el historial de un cliente (búsqueda por nombre parcial)."""
+    async with _get_conn() as conn:
+        cliente = await conn.fetchrow(
+            "SELECT id, razon_social FROM clientes_prospectos WHERE razon_social ILIKE $1 LIMIT 1",
+            f"%{cliente_nombre}%",
+        )
+        if not cliente:
+            return {"error": f"Cliente '{cliente_nombre}' no encontrado"}
+        row = await conn.fetchrow(
+            """INSERT INTO interacciones (cliente_id, tipo, notas, fecha)
+               VALUES ($1, $2, $3, $4) RETURNING id""",
+            cliente["id"],
+            tipo,
+            notas,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    return {"ok": True, "interaccion_id": row["id"], "cliente": cliente["razon_social"]}

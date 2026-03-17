@@ -27,7 +27,12 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from src.cotizador import buscar_cliente, generar_cotizacion
+from src.cotizador import (
+    CLAUDE_MODEL_PROPUESTA,
+    buscar_cliente,
+    generar_cotizacion,
+    registrar_interaccion,
+)
 
 load_dotenv()
 
@@ -39,19 +44,67 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-_TTL_SEGUNDOS = 1800        # 30 minutos — expiración de estado del wizard
-_COTIZACION_TIMEOUT = 120   # segundos — timeout de llamada al cotizador
+_TTL_SEGUNDOS = 1800        # 30 min — expiración de estado wizard
+_COTIZACION_TIMEOUT = 120   # segundos — timeout de llamadas al cotizador
 
 # Rate limiting: máx 5 mensajes por usuario en 10 segundos
 _RATE_LIMIT_CALLS = 5
 _RATE_LIMIT_WINDOW = 10
 _user_timestamps: dict[int, list[float]] = defaultdict(list)
 
+# Palabras que indican que el usuario quiere modificar la propuesta anterior
+_PALABRAS_REFINAMIENTO = frozenset([
+    "modific", "cambi", "agrega", "quit", "reemplaz",
+    "mismo cliente", "anterior", "más unidades", "menos unidades",
+    "actualiz", "aumentar", "reducir", "otra opción", "alternativa",
+])
 
-# ── Helpers internos ──────────────────────────────────────────────────────────
+# Saludos y entradas triviales que no ameritan llamar al LLM
+_SALUDOS = frozenset([
+    "hola", "hi", "hey", "buenas", "buen dia", "buen día",
+    "buenos dias", "buenos días", "ok", "gracias", "si", "sí",
+    "no", "dale", "listo", "perfecto", "genial", "excelente",
+])
 
-def _siguiente_numero() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+# Patrones para extraer el nombre del cliente del texto libre
+_RE_CLIENTE = [
+    re.compile(r'cliente[:\s]+([A-Za-záéíóúñÁÉÍÓÚÑ][^\s,\.\n]{1,}(?:\s[A-Za-záéíóúñÁÉÍÓÚÑ][^\s,\.\n]{1,}){0,2})', re.IGNORECASE),
+    re.compile(r'para\s+(?:la\s+empresa\s+|el\s+cliente\s+)?([A-Z][^\s,\.\n]{1,}(?:\s[A-Z][^\s,\.\n]{1,}){0,2})'),
+    re.compile(r'empresa[:\s]+([A-Za-záéíóúñÁÉÍÓÚÑ][^\s,\.\n]{1,}(?:\s[A-Za-záéíóúñÁÉÍÓÚÑ][^\s,\.\n]{1,}){0,2})', re.IGNORECASE),
+]
+
+
+# ── Helpers de análisis de input ──────────────────────────────────────────────
+
+def _extraer_cliente(texto: str) -> str:
+    for pattern in _RE_CLIENTE:
+        m = pattern.search(texto)
+        if m:
+            return m.group(1).strip().rstrip('.,;: ')
+    return "No especificado"
+
+
+def _es_input_trivial(texto: str) -> bool:
+    limpio = texto.lower().strip().rstrip('!?.¿¡')
+    return limpio in _SALUDOS or len(texto) < 5
+
+
+def _es_refinamiento(texto: str, ultima_propuesta: dict | None) -> bool:
+    if not ultima_propuesta:
+        return False
+    texto_lower = texto.lower()
+    return any(p in texto_lower for p in _PALABRAS_REFINAMIENTO)
+
+
+def _resumen_propuesta(propuesta: dict) -> str:
+    """Texto compacto de una propuesta para contexto multi-turno."""
+    cliente = propuesta.get("cliente", "cliente desconocido")
+    items = ", ".join(
+        f"{p['sku']} x{p['cantidad']}"
+        for p in propuesta.get("productos", [])[:5]
+    )
+    total = propuesta.get("total_usd", 0)
+    return f"PROPUESTA ANTERIOR — Cliente: {cliente} | Productos: {items} | Total: USD {total:.2f}"
 
 
 def _estado_expirado(ctx: dict) -> bool:
@@ -59,7 +112,6 @@ def _estado_expirado(ctx: dict) -> bool:
 
 
 def _rate_limited(user_id: int) -> bool:
-    """Retorna True si el usuario superó el límite de mensajes."""
     now = time.time()
     calls = [t for t in _user_timestamps[user_id] if now - t < _RATE_LIMIT_WINDOW]
     _user_timestamps[user_id] = calls
@@ -70,7 +122,6 @@ def _rate_limited(user_id: int) -> bool:
 
 
 def _mensaje_error_amigable(e: Exception) -> str:
-    """Convierte una excepción técnica en un mensaje comprensible para el usuario."""
     msg = str(e).lower()
     if isinstance(e, asyncio.TimeoutError):
         return "La consulta tardó demasiado. Intentá con un requerimiento más específico o usá /nueva."
@@ -113,22 +164,19 @@ async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_nueva(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancela el flujo en curso y permite empezar de cero."""
     context.user_data.clear()
     await update.message.reply_text("Listo, empezamos de nuevo. Describí el requerimiento.")
 
 
 async def cmd_tarifa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Muestra o establece la tarifa de descuento activa para esta sesión."""
     args = context.args
-
     if not args:
         tarifa_actual = context.user_data.get("tarifa")
         if tarifa_actual:
             await update.message.reply_text(
                 f"Tarifa activa: *{tarifa_actual}*\n\n"
                 "Para cambiarla: /tarifa <nombre exacto>\n"
-                "Para ver opciones enviá: /tarifa lista",
+                "Para ver opciones: /tarifa lista",
                 parse_mode="Markdown"
             )
         else:
@@ -140,7 +188,6 @@ async def cmd_tarifa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     nombre = " ".join(args).strip()
-
     if nombre.lower() == "lista":
         await update.message.reply_text(
             "Tarifas disponibles (copiá el nombre exacto):\n\n"
@@ -161,7 +208,6 @@ async def cmd_tarifa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Muestra el perfil completo de un cliente con historial e interacciones."""
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -224,7 +270,6 @@ async def cmd_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ── Wizard de preguntas (inline keyboards) ────────────────────────────────────
 
 def _normalizar_pregunta(p) -> dict:
-    """Garantiza que la pregunta sea dict con los campos mínimos."""
     if isinstance(p, str):
         return {"texto": p, "opciones": [], "contexto": None, "no_se_asuncion": None}
     return p
@@ -279,7 +324,6 @@ async def _mostrar_pregunta(message, context: ContextTypes.DEFAULT_TYPE, idx: in
         asuncion_val = no_se.split("(")[0].strip()
         msg += f"\n\n_Si no tenés el dato, asumiremos: {asuncion_val}_"
 
-    # Sin opciones → texto libre (Claude no siguió el nuevo formato)
     if not opciones and not no_se:
         msg += "\n\nRespondé en texto libre."
         await message.reply_text(msg, parse_mode="Markdown")
@@ -316,15 +360,36 @@ async def _iniciar_flujo_preguntas(
             f"Entendí: _{resumen}_\n\nTengo algunas preguntas:",
             parse_mode="Markdown"
         )
-
     if preguntas:
         await _mostrar_pregunta(message, context, 0)
     else:
         await message.reply_text("No hay preguntas pendientes. Podés describir el requerimiento de nuevo.")
 
 
+async def _mostrar_confirmacion_wizard(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra resumen de respuestas del wizard con [Confirmar] / [Corregir] antes de llamar al LLM."""
+    ctx = context.user_data.get("cotizacion_pendiente", {})
+    respuestas = ctx.get("respuestas", {})
+
+    if not respuestas:
+        # Sin respuestas para confirmar — proceder directamente
+        await _completar_cotizacion(message, context)
+        return
+
+    lineas = ["*Parámetros del requerimiento:*"]
+    for k, v in respuestas.items():
+        lineas.append(f"• {k}: {v}")
+    lineas.append("\n¿Confirmás estos datos?")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Confirmar", callback_data="wiz:confirmar"),
+        InlineKeyboardButton("Corregir desde el inicio", callback_data="wiz:corregir"),
+    ]])
+    await message.reply_text("\n".join(lineas), reply_markup=keyboard, parse_mode="Markdown")
+
+
 async def _completar_cotizacion(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Resubmite al cotizador con las respuestas acumuladas del wizard."""
+    """Llama al cotizador con las respuestas del wizard. Usa el modelo de propuesta (Sonnet)."""
     ctx = context.user_data.pop("cotizacion_pendiente")
     requerimiento = ctx["requerimiento_original"]
     cliente = ctx["cliente"]
@@ -345,6 +410,7 @@ async def _completar_cotizacion(message, context: ContextTypes.DEFAULT_TYPE) -> 
                 requerimiento=requerimiento_completo,
                 cliente=cliente,
                 tarifa_nombre=tarifa,
+                model=CLAUDE_MODEL_PROPUESTA,  # Modelo de mayor calidad post-wizard
             ),
             timeout=_COTIZACION_TIMEOUT,
         )
@@ -352,6 +418,48 @@ async def _completar_cotizacion(message, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error("Error completando cotización: %s", e, exc_info=True)
         await message.reply_text(_mensaje_error_amigable(e))
+
+
+# ── Confirmación pre-PDF y menú post-propuesta ────────────────────────────────
+
+async def _mostrar_confirmacion_propuesta(
+    message, context: ContextTypes.DEFAULT_TYPE, propuesta: dict
+) -> None:
+    """Muestra resumen de productos con [Generar PDF] / [Buscar alternativa] antes de enviar."""
+    cliente = propuesta.get("cliente", "No especificado")
+    productos = propuesta.get("productos", [])
+
+    lineas = [f"*Propuesta para {cliente}*\n"]
+    for p in productos:
+        lineas.append(f"• `{p['sku']}` × {p['cantidad']} — USD {p['precio_usd']:.2f}")
+        lineas.append(f"  _{p['descripcion'][:70]}_")
+    lineas.append(f"\n*Total: USD {propuesta.get('total_usd', 0):.2f}*")
+    norma = propuesta.get("norma_aplicable", "")
+    if norma:
+        lineas.append(f"Norma: {norma}")
+    lineas.append(f"Entrega: {propuesta.get('tiempo_entrega_dias', 30)} días")
+
+    context.user_data["propuesta_pendiente"] = propuesta
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Generar PDF", callback_data="prop:confirmar"),
+        InlineKeyboardButton("Buscar alternativa", callback_data="prop:alternativa"),
+    ]])
+    await message.reply_text("\n".join(lineas), reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def _mostrar_menu_post_propuesta(message) -> None:
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Modificar cantidad", callback_data="action:modificar"),
+            InlineKeyboardButton("Nueva cotización", callback_data="action:nueva"),
+        ],
+        [
+            InlineKeyboardButton("Guardar en CRM", callback_data="action:crm"),
+            InlineKeyboardButton("Cambiar tarifa", callback_data="action:tarifa"),
+        ],
+    ])
+    await message.reply_text("¿Qué hacemos ahora?", reply_markup=keyboard)
 
 
 async def _despachar_resultado(
@@ -380,10 +488,15 @@ async def _despachar_resultado(
         await _iniciar_flujo_preguntas(message, context, resultado, requerimiento, cliente)
 
     else:
-        await _enviar_propuesta(message, resultado)
+        # Propuesta lista → mostrar confirmación pre-PDF
+        await _mostrar_confirmacion_propuesta(message, context, resultado)
 
 
 # ── Envío de propuesta ────────────────────────────────────────────────────────
+
+def _siguiente_numero() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
 
 async def _enviar_propuesta(message, propuesta: dict) -> None:
     numero = _siguiente_numero()
@@ -433,14 +546,25 @@ async def _enviar_propuesta(message, propuesta: dict) -> None:
         )
 
 
-# ── Handlers principales ──────────────────────────────────────────────────────
+# ── Handlers de callbacks (router por prefijo) ────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Procesa los clicks en los botones inline del wizard de preguntas."""
     query = update.callback_query
     await query.answer()
-
     data = query.data or ""
+
+    if re.match(r"q\d+:", data):
+        await _cb_wizard_pregunta(query, context, data)
+    elif data.startswith("wiz:"):
+        await _cb_wizard_confirmacion(query, context, data[4:])
+    elif data.startswith("prop:"):
+        await _cb_prop_confirmacion(query, context, data[5:])
+    elif data.startswith("action:"):
+        await _cb_accion(query, context, data[7:])
+
+
+async def _cb_wizard_pregunta(query, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    """Procesa la respuesta a una pregunta del wizard."""
     ctx = context.user_data.get("cotizacion_pendiente")
 
     if not ctx or _estado_expirado(ctx):
@@ -456,8 +580,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     preg_idx = int(match.group(1))
     opcion_raw = match.group(2)
-
     preguntas = ctx["preguntas_pendientes"]
+
     if preg_idx >= len(preguntas):
         return
 
@@ -481,12 +605,119 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if siguiente < len(preguntas):
         await _mostrar_pregunta(query.message, context, siguiente)
     else:
+        # Wizard completo → mostrar resumen para confirmar antes de llamar al LLM
+        await _mostrar_confirmacion_wizard(query.message, context)
+
+
+async def _cb_wizard_confirmacion(query, context: ContextTypes.DEFAULT_TYPE, accion: str) -> None:
+    if accion == "confirmar":
         await query.message.reply_text("Procesando con la información adicional...")
         await _completar_cotizacion(query.message, context)
+    elif accion == "corregir":
+        ctx = context.user_data.get("cotizacion_pendiente")
+        if ctx:
+            ctx["respuestas"] = {}
+            ctx["pregunta_actual"] = 0
+            ctx["timestamp"] = time.time()
+            await query.message.reply_text("De acuerdo, empezamos de nuevo las preguntas.")
+            await _mostrar_pregunta(query.message, context, 0)
+        else:
+            await query.message.reply_text("La sesión expiró. Describí el requerimiento de nuevo.")
 
+
+async def _cb_prop_confirmacion(query, context: ContextTypes.DEFAULT_TYPE, accion: str) -> None:
+    if accion == "confirmar":
+        propuesta = context.user_data.pop("propuesta_pendiente", None)
+        if not propuesta:
+            await query.message.reply_text(
+                "No hay propuesta pendiente. Describí el requerimiento de nuevo."
+            )
+            return
+        context.user_data["ultima_propuesta"] = propuesta
+        await _enviar_propuesta(query.message, propuesta)
+        await _mostrar_menu_post_propuesta(query.message)
+
+    elif accion == "alternativa":
+        propuesta = context.user_data.pop("propuesta_pendiente", None)
+        if propuesta:
+            context.user_data["refinamiento_ctx"] = _resumen_propuesta(propuesta)
+        await query.message.reply_text(
+            "¿Qué querés cambiar? Describilo en texto libre.\n\n"
+            "Ejemplo: \"Necesito versión para 110 VAC\" o \"Buscar de otra familia de producto\""
+        )
+
+
+async def _cb_accion(query, context: ContextTypes.DEFAULT_TYPE, accion: str) -> None:
+    if accion == "nueva":
+        context.user_data.pop("ultima_propuesta", None)
+        context.user_data.pop("propuesta_pendiente", None)
+        context.user_data.pop("cotizacion_pendiente", None)
+        context.user_data.pop("refinamiento_ctx", None)
+        await query.message.reply_text("Listo. Describí el nuevo requerimiento.")
+
+    elif accion == "modificar":
+        ultima = context.user_data.get("ultima_propuesta")
+        if not ultima:
+            await query.message.reply_text("No hay propuesta anterior para modificar.")
+            return
+        productos = ultima.get("productos", [])
+        items_txt = "\n".join(f"  • {p['sku']} × {p['cantidad']}" for p in productos)
+        await query.message.reply_text(
+            f"Productos de la propuesta anterior:\n{items_txt}\n\n"
+            "Escribí la modificación que necesitás. Ejemplos:\n"
+            "• \"Cambiá el PNOZ-S6 a 3 unidades\"\n"
+            "• \"Agregá 2 borneras de 10mm2\"\n"
+            "• \"Cambiá el cliente a Techint\""
+        )
+
+    elif accion == "crm":
+        ultima = context.user_data.get("ultima_propuesta")
+        cliente_nombre = ultima.get("cliente") if ultima else None
+        if not ultima or not cliente_nombre or cliente_nombre == "No especificado":
+            await query.message.reply_text(
+                "No hay cliente asociado a la propuesta.\n"
+                "Usá /cliente <nombre> para ver el perfil del cliente."
+            )
+            return
+        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
+        productos_txt = ", ".join(
+            f"{p['sku']} x{p['cantidad']}"
+            for p in ultima.get("productos", [])[:5]
+        )
+        notas = f"Cotización: {productos_txt}. Total: USD {ultima.get('total_usd', 0):.2f}"
+        try:
+            resultado = await registrar_interaccion(
+                cliente_nombre=cliente_nombre,
+                notas=notas,
+                tipo="cotizacion",
+            )
+            if resultado.get("error"):
+                await query.message.reply_text(
+                    f"No encontré a *{cliente_nombre}* en el CRM.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.message.reply_text(
+                    f"Guardado en CRM para *{resultado['cliente']}*.",
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            logger.error("Error guardando en CRM: %s", e, exc_info=True)
+            await query.message.reply_text("No se pudo guardar en el CRM. Intentá de nuevo.")
+
+    elif accion == "tarifa":
+        await query.message.reply_text(
+            "Tarifas disponibles (usá /tarifa <nombre> para activar):\n\n"
+            "• Dist. Principal - Pilz 25% - Resto 30+10\n"
+            "• 30% OBO - Cabur - Pilz 0%\n"
+            "• Pilz System Partner - 30+10\n"
+            "• End User (5%)"
+        )
+
+
+# ── Handler principal de texto ────────────────────────────────────────────────
 
 async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler principal: recibe texto libre y dispara el cotizador."""
     texto = update.message.text.strip()
     if not texto:
         return
@@ -496,7 +727,15 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Estás enviando mensajes muy rápido. Esperá un momento.")
         return
 
-    # Si hay un wizard activo con una pregunta sin opciones (texto libre), procesar como respuesta
+    # Input trivial — no llamar al LLM
+    if _es_input_trivial(texto):
+        await update.message.reply_text(
+            "Describí el requerimiento técnico para generar una cotización.\n"
+            "Ejemplo: \"Relé de seguridad para parada de emergencia PL e, cliente Arcor\""
+        )
+        return
+
+    # Si hay un wizard con pregunta de texto libre activa → procesar como respuesta
     ctx_pendiente = context.user_data.get("cotizacion_pendiente")
     if ctx_pendiente and not _estado_expirado(ctx_pendiente):
         idx = ctx_pendiente.get("pregunta_actual", 0)
@@ -511,8 +750,7 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
                 if siguiente < len(preguntas):
                     await _mostrar_pregunta(update.message, context, siguiente)
                 else:
-                    await update.message.reply_text("Procesando con la información adicional...")
-                    await _completar_cotizacion(update.message, context)
+                    await _mostrar_confirmacion_wizard(update.message, context)
                 return
 
         # Wizard activo pero el usuario manda un requerimiento nuevo → cancelar
@@ -521,6 +759,25 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
             "Cancelé la cotización anterior. Procesando el nuevo requerimiento..."
         )
 
+    # Contexto de "Buscar alternativa" (de prop:alternativa)
+    refinamiento_ctx = context.user_data.pop("refinamiento_ctx", None)
+
+    # Multi-turno: ¿el usuario quiere modificar la propuesta anterior?
+    ultima = context.user_data.get("ultima_propuesta")
+    model_a_usar = None  # Haiku por default
+
+    if refinamiento_ctx:
+        requerimiento_a_usar = refinamiento_ctx + f"\n\nBUSCAR ALTERNATIVA: {texto}"
+        model_a_usar = CLAUDE_MODEL_PROPUESTA
+    elif _es_refinamiento(texto, ultima):
+        requerimiento_a_usar = _resumen_propuesta(ultima) + f"\n\nMODIFICACIÓN: {texto}"
+        model_a_usar = CLAUDE_MODEL_PROPUESTA
+    else:
+        requerimiento_a_usar = texto
+
+    # Extracción de cliente del texto libre
+    cliente = _extraer_cliente(texto)
+
     tarifa_activa = context.user_data.get("tarifa")
     await update.message.reply_text("Consultando catálogo y preparando propuesta...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
@@ -528,13 +785,14 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         resultado = await asyncio.wait_for(
             generar_cotizacion(
-                requerimiento=texto,
-                cliente="No especificado",
+                requerimiento=requerimiento_a_usar,
+                cliente=cliente,
                 tarifa_nombre=tarifa_activa,
+                model=model_a_usar,
             ),
             timeout=_COTIZACION_TIMEOUT,
         )
-        await _despachar_resultado(update.message, context, resultado, texto, "No especificado")
+        await _despachar_resultado(update.message, context, resultado, requerimiento_a_usar, cliente)
     except Exception as e:
         context.user_data.pop("cotizacion_pendiente", None)
         logger.error("Error procesando requerimiento: %s", e, exc_info=True)
@@ -550,7 +808,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler global de errores no capturados — evita que el bot muera en silencio."""
     logger.error("Error no capturado: %s", context.error, exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
