@@ -26,7 +26,7 @@ _raw_url = os.getenv("DATABASE_PUBLIC_URL") or os.getenv("DATABASE_URL", "")
 DATABASE_URL = _raw_url.replace("postgres://", "postgresql://", 1)
 if "sslmode" not in DATABASE_URL:
     DATABASE_URL += "?sslmode=require"
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
 # ── Guías técnicas de selección ───────────────────────────────────────────────
 
@@ -454,7 +454,7 @@ async def llamar_claude(requerimiento: str, cliente: str, tarifa_nombre: Optiona
     for _iter in range(_MAX_ITER):
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=8192,
+            max_tokens=4096,
             system=_build_system_prompt(tarifa_nombre),
             tools=TOOLS,
             messages=messages,
