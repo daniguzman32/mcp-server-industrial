@@ -134,21 +134,30 @@ def _mensaje_error_amigable(e: Exception) -> str:
     return "Algo salió mal. Si persiste, usá /nueva y reformulá el requerimiento."
 
 
+# ── Menú inicial ──────────────────────────────────────────────────────────────
+
+async def _mostrar_menu_inicio(message) -> None:
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Nueva cotización", callback_data="menu:cotizar"),
+            InlineKeyboardButton("Buscar cliente", callback_data="menu:cliente"),
+        ],
+        [
+            InlineKeyboardButton("Ver tarifas", callback_data="menu:tarifas"),
+            InlineKeyboardButton("Ver ejemplos", callback_data="menu:ayuda"),
+        ],
+    ])
+    await message.reply_text(
+        "Hola! Soy el Cotizador Técnico de Fachmann.\n\n"
+        "¿Qué querés hacer?",
+        reply_markup=keyboard,
+    )
+
+
 # ── Comandos ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Hola! Soy el Cotizador Técnico de Fachmann.\n\n"
-        "Describí el requerimiento técnico del cliente y te genero la propuesta.\n\n"
-        "Ejemplo:\n"
-        "\"Prensa con control de dos manos, categoría 4, cliente Arcor\"\n\n"
-        "Comandos:\n"
-        "/start — este mensaje\n"
-        "/ayuda — ejemplos de requerimientos\n"
-        "/cliente <nombre> — perfil + historial de un cliente\n"
-        "/tarifa — ver o cambiar tarifa de descuento activa\n"
-        "/nueva — cancelar cotización en curso y empezar de nuevo"
-    )
+    await _mostrar_menu_inicio(update.message)
 
 
 async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -561,6 +570,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _cb_prop_confirmacion(query, context, data[5:])
     elif data.startswith("action:"):
         await _cb_accion(query, context, data[7:])
+    elif data.startswith("menu:"):
+        await _cb_menu(query, context, data[5:])
 
 
 async def _cb_wizard_pregunta(query, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
@@ -647,6 +658,43 @@ async def _cb_prop_confirmacion(query, context: ContextTypes.DEFAULT_TYPE, accio
         )
 
 
+async def _cb_menu(query, context: ContextTypes.DEFAULT_TYPE, accion: str) -> None:
+    if accion == "cotizar":
+        await query.message.reply_text(
+            "Describí el requerimiento técnico del cliente y te genero la propuesta.\n\n"
+            "Ejemplo: \"Prensa con control de dos manos, categoría 4, cliente Arcor\""
+        )
+    elif accion == "cliente":
+        await query.message.reply_text(
+            "¿Qué cliente querés buscar? Escribí el nombre o parte del nombre.\n\n"
+            "Ejemplo: escribí *Arcor* o usá /cliente Arcor",
+            parse_mode="Markdown",
+        )
+    elif accion == "tarifas":
+        tarifa_activa = context.user_data.get("tarifa")
+        activa_txt = f"\nActiva ahora: *{tarifa_activa}*" if tarifa_activa else "\nSin tarifa activa (precio de lista)."
+        await query.message.reply_text(
+            "Tarifas disponibles:\n\n"
+            "• Dist. Principal - Pilz 25% - Resto 30+10\n"
+            "• 30% OBO - Cabur - Pilz 0%\n"
+            "• Pilz System Partner - 30+10\n"
+            "• End User (5%)\n"
+            f"{activa_txt}\n\n"
+            "Para activar: /tarifa <nombre exacto>",
+            parse_mode="Markdown",
+        )
+    elif accion == "ayuda":
+        await query.message.reply_text(
+            "Ejemplos de requerimientos:\n\n"
+            "• \"Módulo seguridad para prensa dos manos categoría 4, cliente Techint\"\n"
+            "• \"Relé para parada de emergencia PL e, planta Arcor Córdoba\"\n"
+            "• \"Bandejas portacables para tablero 2m x 60cm, proyecto Molinos\"\n"
+            "• \"Sistema configurable para 4 funciones de seguridad simultáneas\"\n\n"
+            "Podés mencionar el cliente en el texto para personalizar el email.\n"
+            "Usá /nueva en cualquier momento para cancelar y empezar de cero."
+        )
+
+
 async def _cb_accion(query, context: ContextTypes.DEFAULT_TYPE, accion: str) -> None:
     if accion == "nueva":
         context.user_data.pop("ultima_propuesta", None)
@@ -727,12 +775,9 @@ async def handle_requerimiento(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Estás enviando mensajes muy rápido. Esperá un momento.")
         return
 
-    # Input trivial — no llamar al LLM
+    # Input trivial (saludo, "ok", texto muy corto) → mostrar menú inicio
     if _es_input_trivial(texto):
-        await update.message.reply_text(
-            "Describí el requerimiento técnico para generar una cotización.\n"
-            "Ejemplo: \"Relé de seguridad para parada de emergencia PL e, cliente Arcor\""
-        )
+        await _mostrar_menu_inicio(update.message)
         return
 
     # Si hay un wizard con pregunta de texto libre activa → procesar como respuesta
