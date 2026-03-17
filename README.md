@@ -1,11 +1,11 @@
 # fachmann-mcp
 
-Sistema de asistencia comercial B2B para Fachmann, representante en Argentina de **PILZ** (seguridad funcional), **OBO Bettermann** (gestión de cables) y **CABUR** (borneras y conectores).
+Sistema de asistencia comercial B2B para Fachmann, representante en Argentina de **PILZ** (seguridad funcional), **OBO Bettermann** (gestión de cables), **CABUR** (borneras y conectores) e **IDEM Safety** (dispositivos de seguridad perimetral).
 
 Compuesto por dos servicios independientes desplegados en Railway:
 
 - **MCP Server** (`web`): servidor HTTP que expone herramientas CRM a clientes MCP (Claude Desktop, agentes, etc.).
-- **Telegram Bot** (`worker`): cotizador técnico conversacional que recibe requerimientos en lenguaje natural, consulta el catálogo vía Claude API con function calling, y devuelve una propuesta técnica en PDF con borrador de email.
+- **Telegram Bot** (`worker`): cotizador técnico conversacional que recibe requerimientos en lenguaje natural, guía al vendedor con preguntas técnicas mediante botones inline, y devuelve una propuesta técnica en PDF con borrador de email.
 
 ---
 
@@ -18,11 +18,11 @@ Compuesto por dos servicios independientes desplegados en Railway:
 ┌──────────────┐  HTTP   │  ┌──────────────────────────────────────┐│
 │ Claude       │◄────────┤  │  web service (MCP HTTP Server)       ││
 │ Desktop /    │         │  │  python src/server.py                ││
-│ MCP Client   │         │  │  FastMCP + aiosqlite                 ││
+│ MCP Client   │         │  │  FastMCP + asyncpg                   ││
 └──────────────┘         │  │  Port: $PORT (Railway) / 8000 (local)││
                          │  └──────────────────┬───────────────────┘│
                          │                     │                     │
-                         │              SQLite │ data/fachmann.db   │
+                         │           PostgreSQL │ (Railway plugin)   │
                          │                     │                     │
                          │  ┌──────────────────┴───────────────────┐│
                          │  │  worker service (Telegram Bot)       ││
@@ -34,11 +34,11 @@ Compuesto por dos servicios independientes desplegados en Railway:
                                                │ Anthropic API
                                                ▼
                                    ┌───────────────────────┐
-                                   │  Claude (claude-       │
-                                   │  sonnet-4-6)          │
-                                   │  Function calling:     │
+                                   │  Claude Haiku 4.5     │
+                                   │  Function calling:    │
                                    │  buscar_catalogo      │
                                    │  consultar_disponib.  │
+                                   │  listar_tarifas       │
                                    └───────────────────────┘
 
 Flujo del Telegram Bot:
@@ -46,16 +46,23 @@ Flujo del Telegram Bot:
                                      │
                               cotizador.py (agentic loop)
                                      │
-                              Claude API ◄──► SQLite catalog
-                                     │
-                              propuesta JSON
-                                     │
-                    ┌────────────────┴────────────────┐
-                    │                                  │
-              pdf_generator.py                  email_draft
-              (Jinja2 + WeasyPrint)             (texto Markdown)
-                    │
-                PDF bytes ──► Telegram reply_document
+                         ┌───────────┴───────────┐
+                         │                       │
+                   Claude API ◄──► PostgreSQL catalog
+                         │
+                   resultado JSON (tipo)
+                         │
+          ┌──────────────┼──────────────┐
+          │              │              │
+       propuesta       preguntas    sin_resultado
+          │           (wizard)
+          │         botones inline
+    ┌─────┴──────┐   por pregunta
+    │            │
+pdf_generator  email_draft
+(ReportLab)   (Markdown)
+    │
+PDF bytes ──► Telegram reply_document
 ```
 
 ---
@@ -63,40 +70,45 @@ Flujo del Telegram Bot:
 ## Features
 
 **MCP Server (CRM tools)**
-- Busqueda de texto libre en el catalogo de 15 productos (PILZ, OBO, CABUR) con filtro por marca
-- Consulta de precio exacto, stock disponible y tiempo de entrega por SKU
-- Recuperacion de perfil completo de clientes/prospectos: datos de contacto, estado del lead, ultimas 5 interacciones y oportunidades de venta activas
-- Registro de interacciones (reunion, email, llamada, whatsapp, nota) con timestamp automatico
+- Búsqueda de texto libre en el catálogo de 27.626 productos (PILZ, OBO, CABUR, IDEM Safety) con filtro por marca
+- Consulta de precio exacto, stock disponible, tiempo de entrega y precio neto con descuento por tarifa
+- Recuperación de perfil completo de clientes/prospectos: datos de contacto, estado del lead, últimas interacciones y oportunidades activas
+- Registro de interacciones (reunión, email, llamada, whatsapp, nota) con timestamp automático
+- Gestión de oportunidades de venta: creación y actualización de etapa en el pipeline
 
-**Telegram Bot (Cotizador Tecnico)**
-- Recibe requerimientos tecnicos en lenguaje natural (sin estructura requerida)
-- Extrae nombre del cliente si se menciona en el texto
-- Loop agentico: Claude llama a `buscar_catalogo` y `consultar_disponibilidad` iterativamente hasta armar la propuesta optima
-- Genera PDF de propuesta comercial numerada (Jinja2 + WeasyPrint) y lo adjunta directamente en el chat
-- Incluye borrador de email profesional listo para copiar y enviar al cliente
-- Fallback a resumen en texto Markdown si WeasyPrint no esta disponible (ej. Windows local sin GTK3)
-- Propuestas numeradas secuencialmente por ano: `2026-001`, `2026-002`, etc.
+**Telegram Bot (Cotizador Técnico)**
+- Requerimientos en lenguaje natural sin estructura requerida
+- **Wizard de preguntas técnicas con botones inline**: cuando falta información, el bot presenta preguntas con opciones en teclado Telegram (no text input). Cada pregunta incluye contexto técnico, referencia normativa y opción "No sé" con asunción segura
+- **Descuentos por tarifa en cascada**: `/tarifa` activa una tarifa de descuento para la sesión; el cotizador calcula `precio = lista × (1-d1) × (1-d2) × (1-d3)` automáticamente
+- **TTL de sesión**: estado del wizard auto-expira a los 30 minutos con notificación al usuario
+- Prioridad de marcas: PILZ para seguridad funcional, IDEM Safety como complemento, OBO y CABUR para infraestructura
+- Genera PDF de propuesta comercial numerada y lo adjunta directamente en el chat
+- Borrador de email profesional listo para copiar
+- Fallback a resumen en texto Markdown si el generador de PDF no está disponible
+- `/cliente <nombre>` — perfil completo + historial de interacciones + oportunidades activas
+- `/nueva` — cancela el wizard activo y limpia el estado de la sesión
 
 **Normativa integrada**
-- System prompt embebe el conocimiento de ISO 13849-1:2015 (PL a–e, Categorias 1–4)
-- Reglas de seleccion de producto PILZ codificadas: parada de emergencia, control dos manos, proteccion de resguardos, sistemas complejos, monitoreo de velocidad
-- Justificacion normativa incluida en cada linea de producto de la propuesta
+- System prompt embebe ISO 13849-1:2015 (PL a–e, Categorías 1–4)
+- Guías técnicas de selección por marca en `src/guides/` (pilz.md, idem_safety.md, obo.md, cabur.md)
+- Cada pregunta del wizard incluye `nivel_criticidad` (alta/media/baja) y `referencia_normativa`
+- Justificación normativa incluida en cada línea de producto de la propuesta
 
 ---
 
 ## Tech Stack
 
-| Componente            | Tecnologia                                  | Version        |
-|-----------------------|---------------------------------------------|----------------|
-| MCP Server            | FastMCP (Python)                            | mcp[cli] >=1.0 |
-| Async DB driver       | aiosqlite                                   | latest         |
-| Base de datos         | SQLite                                      | built-in       |
-| Telegram Bot          | python-telegram-bot                         | >=21.0         |
-| LLM / Function calling| Anthropic Claude API (claude-sonnet-4-6)    | anthropic SDK  |
-| PDF generation        | WeasyPrint + Jinja2                         | latest         |
-| Config management     | python-dotenv                               | latest         |
-| Deployment            | Railway (Nixpacks builder)                  | —              |
-| Runtime               | Python 3.11+                                | —              |
+| Componente            | Tecnología                                          | Versión        |
+|-----------------------|-----------------------------------------------------|----------------|
+| MCP Server            | FastMCP (Python)                                    | mcp[cli] >=1.0 |
+| Async DB driver       | asyncpg                                             | latest         |
+| Base de datos         | PostgreSQL (Railway plugin)                         | 15+            |
+| Telegram Bot          | python-telegram-bot                                 | >=21.0         |
+| LLM / Function calling| Anthropic Claude API (claude-haiku-4-5-20251001)    | anthropic SDK  |
+| PDF generation        | ReportLab                                           | latest         |
+| Config management     | python-dotenv                                       | latest         |
+| Deployment            | Railway (Nixpacks builder)                          | —              |
+| Runtime               | Python 3.11+                                        | —              |
 
 ---
 
@@ -105,23 +117,28 @@ Flujo del Telegram Bot:
 ```
 fachmann-mcp/
 ├── Procfile                  # Railway: proceso web y worker
+├── nixpacks.toml             # Build config Railway (system deps)
 ├── requirements.txt          # Dependencias Python
 ├── .env.example              # Plantilla de variables de entorno
-├── data/
-│   └── fachmann.db           # SQLite (generado por setup_db.py, no versionar)
 ├── src/
 │   ├── __init__.py
-│   ├── server.py             # MCP HTTP server — 4 herramientas CRM
-│   ├── setup_db.py           # Inicializa schema y seed data (15 productos, 7 clientes)
+│   ├── server.py             # MCP HTTP server — herramientas CRM
+│   ├── setup_db.py           # Inicializa schema PostgreSQL (idempotente)
+│   ├── migrar_db.py          # Migración: IDEM Safety + reglas_descuento
 │   ├── cotizador.py          # Agentic loop Claude + function calling
-│   ├── bot.py                # Telegram bot — handler de requerimientos
-│   ├── pdf_generator.py      # Renderiza HTML con Jinja2 y convierte a PDF
-│   └── templates/
-│       └── propuesta.html    # Plantilla HTML de la propuesta comercial
+│   ├── bot.py                # Telegram bot — wizard inline keyboards
+│   ├── pdf_generator.py      # Genera PDF con ReportLab
+│   └── guides/               # Guías técnicas de selección por marca
+│       ├── pilz.md
+│       ├── idem_safety.md
+│       ├── obo.md
+│       └── cabur.md
 └── tests/
     ├── __init__.py
     └── test_cotizador.py
 ```
+
+> `importar_catalogo.py` y archivos `*.xlsx` son privados y están en `.gitignore`.
 
 ---
 
@@ -130,8 +147,7 @@ fachmann-mcp/
 ### Prerequisites
 
 - Python 3.11+
-- En Windows: WeasyPrint requiere GTK3 runtime para generar PDFs. Sin GTK3, el bot funciona con fallback a texto.
-- En Linux/macOS: `sudo apt install libpango-1.0-0 libpangoft2-1.0-0` (Ubuntu) o equivalente.
+- PostgreSQL accesible (local o Railway public URL)
 
 ### 1. Clonar y crear entorno virtual
 
@@ -161,21 +177,19 @@ cp .env.example .env
 python src/setup_db.py
 ```
 
-Esto crea `data/fachmann.db` con el schema completo y 15 productos de ejemplo (5 por marca) junto con 7 clientes/prospectos, 5 oportunidades de venta y 6 interacciones iniciales.
+Crea el schema completo (5 tablas) en PostgreSQL. Es idempotente: se puede correr múltiples veces sin problemas.
 
 ### 4. Correr los servicios
 
-Correr el MCP server (transporte HTTP por defecto):
 ```bash
+# MCP server (transporte HTTP por defecto)
 python src/server.py
-```
 
-Correr el Telegram bot (en otra terminal):
-```bash
+# Telegram bot (en otra terminal)
 python src/bot.py
 ```
 
-Para usar un transporte distinto en el MCP server (ej. stdio para Claude Desktop):
+Para usar stdio (Claude Desktop):
 ```bash
 MCP_TRANSPORT=stdio python src/server.py
 ```
@@ -190,8 +204,6 @@ pytest
 
 ## Setup — Railway Deployment
 
-El proyecto usa dos servicios Railway que comparten la misma imagen pero ejecutan procesos distintos segun el `Procfile`.
-
 ### Procfile
 
 ```
@@ -199,41 +211,38 @@ web:    python src/setup_db.py && python src/server.py
 worker: python src/setup_db.py && python src/bot.py
 ```
 
-Cada servicio corre `setup_db.py` al arranque para garantizar que la base este inicializada (idempotente por uso de `CREATE TABLE IF NOT EXISTS` e `INSERT OR IGNORE`).
-
 ### Pasos
 
-1. Crear un proyecto nuevo en [Railway](https://railway.app).
-2. Conectar el repositorio GitHub.
-3. Railway detecta el `Procfile` automaticamente con Nixpacks.
-4. Crear **dos servicios** dentro del mismo proyecto:
-   - Servicio `web`: apuntar al proceso `web` del Procfile.
-   - Servicio `worker`: apuntar al proceso `worker` del Procfile.
-5. Configurar las variables de entorno en cada servicio (ver tabla abajo).
-6. Railway asigna `$PORT` automaticamente al servicio web; no es necesario configurarlo manualmente.
+1. Crear proyecto en [Railway](https://railway.app) y conectar el repositorio GitHub.
+2. Agregar el **PostgreSQL plugin** al proyecto. Railway inyecta `DATABASE_URL` automáticamente.
+3. Crear **dos servicios** dentro del mismo proyecto:
+   - Servicio `web`: proceso `web` del Procfile.
+   - Servicio `worker`: proceso `worker` del Procfile.
+4. Configurar las variables de entorno en cada servicio (ver tabla abajo).
+5. Railway asigna `$PORT` automáticamente al servicio web.
 
-> **Nota sobre persistencia:** Para produccion, agregar un volumen Railway con mount path `/app/data` en ambos servicios. Sin volumen, el archivo SQLite se pierde en cada redeploy.
+> **Importante:** usar siempre `DATABASE_URL` (URL interna del plugin) desde los contenedores Railway. `DATABASE_PUBLIC_URL` es solo para acceso externo desde scripts locales de administración.
 
 ---
 
 ## Environment Variables
 
-| Variable            | Requerida | Default              | Descripcion                                                                 |
-|---------------------|-----------|----------------------|-----------------------------------------------------------------------------|
-| `ANTHROPIC_API_KEY` | Si        | —                    | API key de Anthropic. Usada por `cotizador.py` para llamar a Claude.        |
-| `TELEGRAM_TOKEN`    | Si        | —                    | Token del bot de Telegram obtenido via BotFather. Requerido solo en worker. |
-| `CLAUDE_MODEL`      | No        | `claude-sonnet-4-6`  | ID del modelo Claude a usar en el cotizador.                                |
-| `DB_PATH`           | No        | `data/fachmann.db`   | Ruta al archivo SQLite. Ambos servicios deben apuntar al mismo archivo.     |
-| `MCP_PORT`          | No        | `8000`               | Puerto local del MCP server. En Railway se sobreescribe con `$PORT`.        |
-| `MCP_HOST`          | No        | `0.0.0.0`            | Host bind del MCP server.                                                   |
-| `MCP_TRANSPORT`     | No        | `streamable-http`    | Transporte del MCP server. Opciones: `streamable-http`, `stdio`.            |
+| Variable            | Requerida | Default                       | Descripción                                                                 |
+|---------------------|-----------|-------------------------------|-----------------------------------------------------------------------------|
+| `DATABASE_URL`      | Sí        | —                             | URL interna de PostgreSQL (inyectada por Railway plugin).                   |
+| `ANTHROPIC_API_KEY` | Sí        | —                             | API key de Anthropic. Usada por `cotizador.py`.                             |
+| `TELEGRAM_TOKEN`    | Sí (worker)| —                            | Token del bot de Telegram obtenido via BotFather.                           |
+| `CLAUDE_MODEL`      | No        | `claude-haiku-4-5-20251001`   | ID del modelo Claude. Usar `claude-sonnet-4-6` para mayor calidad.          |
+| `MCP_PORT`          | No        | `8000`                        | Puerto local del MCP server. En Railway se sobreescribe con `$PORT`.        |
+| `MCP_HOST`          | No        | `0.0.0.0`                     | Host bind del MCP server.                                                   |
+| `MCP_TRANSPORT`     | No        | `streamable-http`             | Transporte del MCP server. Opciones: `streamable-http`, `stdio`.            |
 
 `.env.example`:
 ```env
-DB_PATH=data/fachmann.db
+DATABASE_URL=postgresql://user:password@host:5432/dbname?sslmode=require
 TELEGRAM_TOKEN=your_botfather_token_here
 ANTHROPIC_API_KEY=your_anthropic_key_here
-CLAUDE_MODEL=claude-sonnet-4-6
+CLAUDE_MODEL=claude-haiku-4-5-20251001
 MCP_PORT=8000
 ```
 
@@ -243,216 +252,241 @@ MCP_PORT=8000
 
 ### MCP Tools Reference
 
-El servidor MCP expone cuatro herramientas bajo el namespace `fachmann_mcp`. Cualquier cliente MCP compatible (Claude Desktop, agente Python con SDK MCP, etc.) puede invocarlas.
+El servidor MCP expone herramientas bajo el namespace `fachmann`. Cualquier cliente MCP compatible puede invocarlas.
 
 #### `fachmann_buscar_catalogo`
 
-Busca productos por texto libre en descripcion, SKU, categoria y especificaciones. Filtro opcional por marca.
+Busca productos por texto libre en descripción, SKU, categoría y especificaciones.
 
 **Input:**
-| Campo  | Tipo            | Requerido | Descripcion                                              |
-|--------|-----------------|-----------|----------------------------------------------------------|
-| query  | string (2–200)  | Si        | Texto a buscar (ej. `"rele seguridad"`, `"bandeja"`)     |
-| marca  | string (enum)   | No        | `"PILZ"`, `"OBO"` o `"CABUR"`. Omitir para todas.       |
+| Campo | Tipo           | Requerido | Descripción                                          |
+|-------|----------------|-----------|------------------------------------------------------|
+| query | string         | Sí        | Texto a buscar (ej. `"relé seguridad"`, `"bandeja"`) |
+| marca | string (enum)  | No        | `"PILZ"`, `"OBO"`, `"CABUR"` o `"IDEM SAFETY"`      |
 
-**Output:** JSON `{ "total": int, "productos": [...] }` con sku, marca, categoria, descripcion, precio_usd, stock, tiempo_entrega_dias.
+**Output:** `{ "total_mostrados": int, "productos": [...] }` — hasta 20 resultados con sku, marca, categoría, descripción, precio_lista_usd, stock, tiempo_entrega_dias.
 
 ---
 
 #### `fachmann_consultar_disponibilidad`
 
-Devuelve la ficha completa de un producto por SKU exacto: precio, stock, tiempo de entrega, especificaciones tecnicas y flag `disponible_inmediato`.
+Ficha completa de un producto por SKU: precio de lista, precio neto con descuento de tarifa, análisis de stock vs cantidad solicitada.
 
 **Input:**
-| Campo | Tipo           | Requerido | Descripcion                              |
-|-------|----------------|-----------|------------------------------------------|
-| sku   | string (2–100) | Si        | SKU exacto (ej. `"PNOZ-S6-24VDC-2NO"`)  |
+| Campo    | Tipo    | Requerido | Descripción                                    |
+|----------|---------|-----------|------------------------------------------------|
+| sku      | string  | Sí        | SKU exacto (ej. `"PNOZ-S6-24VDC-2NO"`)        |
+| cantidad | integer | No        | Cantidad requerida para análisis de stock (default: 1) |
 
-**Output:** JSON con todos los campos del producto + `disponible_inmediato: bool`.
+**Output:** Ficha del producto + `estado_stock` (`disponible` / `sin_stock` / `parcial`) + `precio_neto_usd` (con descuento si hay tarifa activa) + `tiempo_entrega_estimado_dias`.
 
 ---
 
 #### `fachmann_buscar_contexto_cliente`
 
-Recupera el perfil de uno o mas clientes/prospectos por nombre (busqueda parcial). Incluye las ultimas 5 interacciones y todas las oportunidades de venta activas (no cerradas).
+Perfil de clientes/prospectos por nombre (búsqueda parcial). Incluye últimas interacciones y oportunidades activas.
 
 **Input:**
-| Campo   | Tipo           | Requerido | Descripcion                                        |
-|---------|----------------|-----------|----------------------------------------------------|
-| empresa | string (2–200) | Si        | Nombre o fragmento (ej. `"Arcor"`, `"Valentina"`)  |
+| Campo   | Tipo   | Requerido | Descripción                               |
+|---------|--------|-----------|-------------------------------------------|
+| empresa | string | Sí        | Nombre o fragmento (ej. `"Arcor"`)        |
 
-**Output:** JSON `{ "total": int, "clientes": [...] }` con datos de contacto, industria, estado_lead, interacciones_recientes y oportunidades_activas.
+**Output:** Datos de contacto, industria, estado_lead, interacciones_recientes, oportunidades_activas.
 
 ---
 
 #### `fachmann_registrar_interaccion`
 
-Registra una nueva interaccion en el historial del cliente. El `cliente_id` se obtiene previamente con `fachmann_buscar_contexto_cliente`.
+Registra una interacción en el historial del cliente.
 
 **Input:**
-| Campo      | Tipo    | Requerido | Descripcion                                                              |
-|------------|---------|-----------|--------------------------------------------------------------------------|
-| cliente_id | int     | Si        | ID numerico del cliente (>= 1)                                           |
-| notas      | string  | Si        | Resumen de la interaccion, acuerdos y proximos pasos (5–2000 caracteres) |
-| tipo       | string  | No        | `"reunion"`, `"email"`, `"llamada"`, `"whatsapp"` o `"nota"` (default)  |
-
-**Output:** JSON de confirmacion con `interaccion_id`, nombre del cliente, tipo y fecha.
+| Campo      | Tipo    | Requerido | Descripción                                                        |
+|------------|---------|-----------|--------------------------------------------------------------------|
+| cliente_id | int     | Sí        | ID del cliente (obtenido con `buscar_contexto_cliente`)            |
+| notas      | string  | Sí        | Resumen de la interacción y próximos pasos                         |
+| tipo       | string  | No        | `"reunion"`, `"email"`, `"llamada"`, `"whatsapp"` o `"nota"`      |
 
 ---
 
-### Telegram Bot Usage
+#### `fachmann_gestionar_oportunidad`
 
-El bot funciona exclusivamente con mensajes de texto libre. No requiere comandos ni estructura especifica.
+Crea o actualiza una oportunidad de venta en el pipeline.
 
-**Comandos disponibles:**
-- `/start` — Muestra el mensaje de bienvenida y descripcion
-- `/ayuda` — Ejemplos de requerimientos que puede procesar
+---
 
-**Flujo de uso:**
+### Telegram Bot — Comandos
+
+| Comando              | Descripción                                                         |
+|----------------------|---------------------------------------------------------------------|
+| `/start`             | Mensaje de bienvenida                                               |
+| `/ayuda`             | Ejemplos de requerimientos                                          |
+| `/tarifa`            | Ver tarifa activa                                                   |
+| `/tarifa lista`      | Ver todas las tarifas disponibles                                   |
+| `/tarifa <nombre>`   | Activar tarifa de descuento para la sesión                          |
+| `/cliente <nombre>`  | Perfil completo + historial + oportunidades activas                 |
+| `/nueva`             | Cancelar wizard en curso y empezar de cero                          |
+
+### Telegram Bot — Flujo de uso
 
 1. El vendedor escribe el requerimiento en lenguaje natural:
    ```
-   Prensa hidraulica con control dos manos, categoria 4, planta Arcor Cordoba.
-   Necesito tambien bandejas portacables para el tablero.
+   Barrera de luz IDEM de 1500mm para zona de acceso, cliente Techint
    ```
 
-2. El bot responde: `"Procesando requerimiento... Consultando catalogo y generando propuesta."`
+2. Si falta información técnica, el bot presenta un **wizard de preguntas con botones inline**:
+   ```
+   Pregunta 1/3 (seguridad crítica — ISO 13849-1)
 
-3. Claude ejecuta un loop agentico:
-   - Llama a `buscar_catalogo("control dos manos", "PILZ")`
-   - Llama a `consultar_disponibilidad("PNOZ-S6-24VDC-2NO")`
-   - Llama a `buscar_catalogo("bandeja portacables", "OBO")`
-   - Consolida la propuesta en JSON estructurado
+   ¿Qué parte del cuerpo se necesita proteger?
 
-4. El bot envia:
-   - **PDF adjunto**: `propuesta_Arcor_2026-03-04.pdf` con numero de propuesta, tabla de productos, justificacion normativa y totales
-   - **Borrador de email**: texto profesional listo para copiar y enviar al cliente
+   [Dedos (14mm)]  [Mano (25mm)]
+   [Cuerpo (90mm)] [No sé / No tengo el dato]
+   ```
 
-**Ejemplos de requerimientos validos:**
+3. El usuario elige con un click. El bot avanza a la siguiente pregunta automáticamente.
+
+4. Con toda la información, Claude ejecuta el agentic loop:
+   - `buscar_catalogo("cortina luz IDEM", "IDEM SAFETY")`
+   - `consultar_disponibilidad("IDEM-SF4B-H1080-14", cantidad=1)`
+   - Consolida propuesta JSON
+
+5. El bot envía:
+   - **PDF adjunto**: propuesta numerada con tabla de productos y justificación normativa
+   - **Borrador de email**: texto profesional listo para enviar
+
+### Tarifas de descuento
+
+Los descuentos se aplican en cascada: `precio_final = lista × (1-d1) × (1-d2) × (1-d3)`
+
 ```
-"Modulo seguridad para prensa dos manos categoria 4, cliente Techint"
-"Rele para parada de emergencia PL e, planta Arcor Cordoba"
-"Bandejas portacables para tablero 2m x 60cm, proyecto Molinos"
-"Sistema configurable para 4 funciones de seguridad simultaneas"
-"Borneras fusibles 10mm2 para tablero 400A, proyecto farmaceutico"
+/tarifa Dist. Principal - Pilz 25% - Resto 30+10
+/tarifa Pilz System Partner - 30+10
+/tarifa 30% OBO - Cabur - Pilz 0%
+/tarifa End User (5%)
 ```
 
 ---
 
 ## Database Schema
 
-SQLite, archivo unico en `data/fachmann.db`. Inicializado con `python src/setup_db.py`.
+PostgreSQL en Railway plugin. Inicializado con `python src/setup_db.py`.
 
 ### `productos_catalogo`
 
-| Columna              | Tipo    | Descripcion                                          |
-|----------------------|---------|------------------------------------------------------|
-| id                   | INTEGER | PK autoincrement                                     |
-| sku                  | TEXT    | Codigo unico del producto (UNIQUE NOT NULL)          |
-| marca                | TEXT    | `PILZ`, `OBO` o `CABUR` (CHECK constraint)           |
-| categoria            | TEXT    | Categoria del producto                               |
-| descripcion          | TEXT    | Descripcion comercial                                |
-| precio_usd           | REAL    | Precio en dolares                                    |
-| especificaciones     | TEXT    | Especificaciones tecnicas detalladas                 |
-| stock                | INTEGER | Unidades en stock (default: 0)                       |
-| tiempo_entrega_dias  | INTEGER | Dias de entrega estimados (default: 30)              |
-| activo               | INTEGER | Flag logico (1 = activo, 0 = inactivo)               |
-| created_at           | TEXT    | Timestamp de creacion                                |
+| Columna             | Tipo    | Descripción                                      |
+|---------------------|---------|--------------------------------------------------|
+| id                  | SERIAL  | PK                                               |
+| sku                 | TEXT    | Código único del producto (UNIQUE NOT NULL)      |
+| marca               | TEXT    | `PILZ`, `OBO`, `CABUR` o `IDEM SAFETY`           |
+| categoria           | TEXT    | Categoría del producto                           |
+| descripcion         | TEXT    | Descripción comercial                            |
+| precio_usd          | NUMERIC | Precio de lista en dólares                       |
+| especificaciones    | TEXT    | Especificaciones técnicas                        |
+| stock               | INTEGER | Unidades en stock                                |
+| tiempo_entrega_dias | INTEGER | Días de entrega estimados                        |
+| activo              | INTEGER | Flag lógico (1 = activo)                         |
 
-**Seed data:** 15 productos (5 por marca).
+**Datos reales:** 27.626 productos (PILZ, OBO, CABUR, IDEM Safety).
 
 ---
 
 ### `clientes_prospectos`
 
-| Columna           | Tipo    | Descripcion                                                                      |
-|-------------------|---------|----------------------------------------------------------------------------------|
-| id                | INTEGER | PK autoincrement                                                                 |
-| razon_social      | TEXT    | Nombre de la empresa                                                             |
-| contacto_nombre   | TEXT    | Nombre del contacto principal                                                    |
-| contacto_email    | TEXT    | Email del contacto                                                               |
-| contacto_telefono | TEXT    | Telefono del contacto                                                            |
-| industria         | TEXT    | Sector industrial                                                                |
-| estado_lead       | TEXT    | `prospecto`, `contactado`, `en_negociacion`, `cliente_activo` o `perdido`        |
-| linkedin_url      | TEXT    | URL de LinkedIn del contacto (nullable)                                          |
-| notas             | TEXT    | Notas internas sobre el cliente                                                  |
-| created_at        | TEXT    | Timestamp de alta                                                                |
-| updated_at        | TEXT    | Timestamp de ultima modificacion                                                 |
-
-**Seed data:** 7 clientes/prospectos (Arcor, Techint, Grupo Fate, Metalurgica Santa Rosa, Sistemi Integrazione, Molinos Rio de la Plata, Laboratorio Roemmers).
+| Columna           | Tipo   | Descripción                                                                    |
+|-------------------|--------|--------------------------------------------------------------------------------|
+| id                | SERIAL | PK                                                                             |
+| razon_social      | TEXT   | Nombre de la empresa                                                           |
+| contacto_nombre   | TEXT   | Nombre del contacto principal                                                  |
+| contacto_email    | TEXT   | Email del contacto                                                             |
+| contacto_telefono | TEXT   | Teléfono del contacto                                                          |
+| contacto_cargo    | TEXT   | Cargo del contacto                                                             |
+| industria         | TEXT   | Sector industrial                                                              |
+| estado_lead       | TEXT   | `nuevo_cliente`, `calificado`, `oferta`, `ganado`, `perdido`, `cancelado`      |
+| notas             | TEXT   | Notas internas sobre el cliente                                                |
+| updated_at        | TEXT   | Timestamp de última modificación                                               |
 
 ---
 
 ### `oportunidades_ventas`
 
-| Columna                | Tipo    | Descripcion                                                                              |
-|------------------------|---------|------------------------------------------------------------------------------------------|
-| id                     | INTEGER | PK autoincrement                                                                         |
-| cliente_id             | INTEGER | FK a `clientes_prospectos.id`                                                            |
-| descripcion            | TEXT    | Descripcion de la oportunidad                                                            |
-| monto_usd              | REAL    | Valor estimado en dolares                                                                |
-| probabilidad_cierre    | INTEGER | Porcentaje de probabilidad (0–100)                                                       |
-| etapa                  | TEXT    | `prospecting`, `qualification`, `proposal`, `negotiation`, `closed_won`, `closed_lost`   |
-| notas_tecnicas         | TEXT    | Notas tecnicas y de competencia                                                          |
-| fecha_creacion         | TEXT    | Timestamp de creacion                                                                    |
-| fecha_cierre_estimada  | TEXT    | Fecha estimada de cierre                                                                 |
-| updated_at             | TEXT    | Timestamp de ultima modificacion                                                         |
+| Columna               | Tipo    | Descripción                                                                             |
+|-----------------------|---------|-----------------------------------------------------------------------------------------|
+| id                    | SERIAL  | PK                                                                                      |
+| cliente_id            | INTEGER | FK a `clientes_prospectos.id`                                                           |
+| descripcion           | TEXT    | Descripción de la oportunidad                                                           |
+| monto_usd             | NUMERIC | Valor estimado en dólares                                                               |
+| probabilidad_cierre   | INTEGER | Porcentaje (0–100)                                                                      |
+| etapa                 | TEXT    | `prospecting`, `qualification`, `proposal`, `negotiation`, `closed_won`, `closed_lost`  |
+| fecha_cierre_estimada | TEXT    | Fecha estimada de cierre                                                                |
 
 ---
 
 ### `interacciones`
 
-| Columna    | Tipo    | Descripcion                                                            |
-|------------|---------|------------------------------------------------------------------------|
-| id         | INTEGER | PK autoincrement                                                       |
-| cliente_id | INTEGER | FK a `clientes_prospectos.id`                                          |
-| tipo       | TEXT    | `reunion`, `email`, `llamada`, `whatsapp` o `nota`                     |
-| notas      | TEXT    | Descripcion de la interaccion (NOT NULL)                               |
-| fecha      | TEXT    | Timestamp de la interaccion                                            |
-
-**Indices:** `idx_productos_marca`, `idx_productos_categoria`, `idx_clientes_nombre`, `idx_interacciones_cli`, `idx_oportunidades_cli`.
+| Columna    | Tipo    | Descripción                                            |
+|------------|---------|--------------------------------------------------------|
+| id         | SERIAL  | PK                                                     |
+| cliente_id | INTEGER | FK a `clientes_prospectos.id`                          |
+| tipo       | TEXT    | `reunion`, `email`, `llamada`, `whatsapp` o `nota`     |
+| notas      | TEXT    | Descripción de la interacción (NOT NULL)               |
+| fecha      | TEXT    | Timestamp de la interacción                            |
 
 ---
 
-## ISO 13849-1:2015 — Normative Context
+### `reglas_descuento`
 
-El cotizador embebe conocimiento normativo de **ISO 13849-1:2015** (Safety of machinery — Safety-related parts of control systems) directamente en el system prompt de Claude.
+Define los porcentajes de descuento en cascada por tarifa y marca.
 
-### Performance Levels (PL) y Categorias
+| Columna       | Tipo    | Descripción                                 |
+|---------------|---------|---------------------------------------------|
+| id            | SERIAL  | PK                                          |
+| tarifa_nombre | TEXT    | Nombre de la tarifa (ej. "End User (5%)")   |
+| marca         | TEXT    | `PILZ`, `OBO`, `CABUR` o `IDEM SAFETY`      |
+| desc_1        | NUMERIC | Primer descuento (%)                        |
+| desc_2        | NUMERIC | Segundo descuento (%)                       |
+| desc_3        | NUMERIC | Tercer descuento (%)                        |
 
-| PL    | Categoria | Descripcion de arquitectura                                      | Producto PILZ tipico  |
-|-------|-----------|------------------------------------------------------------------|-----------------------|
-| PL a  | —         | Sin requisitos de arquitectura especifica                        | —                     |
-| PL b  | Cat 1     | Componente unico probado (bien dimensionado)                     | —                     |
-| PL c  | Cat 2     | Con funcion de test periodico                                    | —                     |
-| PL d  | Cat 3     | Arquitectura redundante de dos canales                           | PNOZ XV2              |
-| PL e  | Cat 4     | Redundante + deteccion de fallas de causa comun                  | PNOZ s6, PNOZmulti 2  |
+Cálculo: `precio_final = precio_lista × (1 - desc_1/100) × (1 - desc_2/100) × (1 - desc_3/100)`
 
-### Reglas de seleccion PILZ (codificadas en el system prompt)
+---
 
-| Aplicacion                          | Producto recomendado            |
+## ISO 13849-1:2015 — Contexto normativo
+
+El cotizador embebe conocimiento normativo de **ISO 13849-1:2015** directamente en el system prompt de Claude, complementado con guías técnicas de selección por marca en `src/guides/`.
+
+### Performance Levels (PL) y Categorías
+
+| PL    | Categoría | Arquitectura                                           | Producto PILZ típico  |
+|-------|-----------|--------------------------------------------------------|-----------------------|
+| PL a  | —         | Sin requisitos de arquitectura específica              | —                     |
+| PL b  | Cat 1     | Componente único probado                               | —                     |
+| PL c  | Cat 2     | Con función de test periódico                          | —                     |
+| PL d  | Cat 3     | Arquitectura redundante de dos canales                 | PNOZ XV2              |
+| PL e  | Cat 4     | Redundante + detección de fallas de causa común        | PNOZ s6, PNOZmulti 2  |
+
+### Reglas de selección (codificadas en el system prompt)
+
+| Aplicación                          | Producto recomendado            |
 |-------------------------------------|---------------------------------|
 | Parada de emergencia, Cat 4 / PL e  | PNOZ s6 o PNOZ XV2              |
 | Control dos manos, Cat 4            | PNOZ s6 o PNOZ XV2              |
-| Proteccion de resguardos, Cat 3–4   | PNOZ XV2                        |
-| Multiples funciones de seguridad    | PNOZmulti 2 (PNOZ-M-B0)         |
+| Protección de resguardos, Cat 3–4   | PNOZ XV2                        |
+| Múltiples funciones de seguridad    | PNOZmulti 2 (PNOZ-M-B0)         |
 | Monitoreo de velocidad segura       | PMCprotego DS (SIL 2)           |
-| Automatizacion segura a escala      | PSS 4000 CPU                    |
-
-Cada propuesta generada por el cotizador incluye el campo `norma_aplicable` con el PL y categoria requeridos, y una `justificacion` por producto que explica la seleccion en terminos normativos.
+| Cortinas de luz / barreras          | IDEM Safety (SF4B, SF4C series) |
+| Interruptores de puerta / bordes    | IDEM Safety                     |
 
 ---
 
 ## Roadmap
 
-- [ ] Persistencia en PostgreSQL (Railway plugin o Supabase) para eliminar limitacion de SQLite efimero
-- [ ] Herramienta MCP `fachmann_crear_oportunidad` para registrar oportunidades desde el agente
-- [ ] Herramienta MCP `fachmann_actualizar_etapa` para mover oportunidades en el pipeline
-- [ ] Autenticacion del bot por `chat_id` para restringir acceso al equipo de ventas
-- [ ] Soporte multi-usuario: numeracion de propuestas por usuario
-- [ ] Template HTML con logo y estilos corporativos Fachmann
-- [ ] Integracion con calendario: sugerir fecha de seguimiento al registrar interaccion
-- [ ] Exportacion de pipeline a CSV desde el MCP server
+- [ ] Autenticación del bot por `chat_id` para restringir acceso al equipo de ventas
+- [ ] Soporte multi-usuario: numeración de propuestas por usuario
+- [ ] Template PDF con logo y estilos corporativos Fachmann
+- [ ] Carga de clientes reales en `clientes_prospectos` (actualmente datos demo)
+- [ ] Integración con calendario: sugerir fecha de seguimiento al registrar interacción
+- [ ] Exportación de pipeline a CSV desde el MCP server
+- [ ] Wizard de preguntas multi-step tipo grafo de riesgo (máquina → función → PL → tensión)
 
 ---
 
